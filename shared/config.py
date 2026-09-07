@@ -11,6 +11,30 @@ class Settings(BaseSettings):
     # Agora
     agora_app_id: str = ""
     agora_app_certificate: str = ""
+    # Agora Conversational AI Engine (CAI). Different creds from App ID/Cert:
+    # Console → RESTful API → Add a secret. Used as Basic auth for the CAI REST
+    # API that spins up a cloud voice agent (ASR → our custom LLM → TTS) in the
+    # channel. When customer_id/secret are unset, the app falls back to the
+    # in-process AgoraSession pipeline.
+    agora_customer_id: str = ""
+    agora_customer_secret: str = ""
+    # CAI region base host. Global is fine for most; override if your project is
+    # region-locked (e.g. the -ap / -eu / -na variants Agora documents).
+    agora_cai_base_url: str = "https://api.agora.io"
+    # Publicly reachable base URL of THIS media worker (the tunnel URL), so the
+    # CAI cloud agent can call our custom OpenAI-compatible LLM endpoint over
+    # HTTPS. Must be set (per demo run) for CAI to work — localhost is unreachable
+    # from Agora's cloud. e.g. https://abc123.ngrok-free.app
+    public_base_url: str = ""
+    # CAI ASR/TTS vendor selection (Sarvam is NOT a CAI ASR vendor, so the CAI
+    # path uses Deepgram for ASR; TTS reuses our Deepgram key too).
+    cai_asr_vendor: str = "deepgram"
+    cai_asr_model: str = "nova-3"
+    cai_asr_language: str = "en-US"
+    cai_tts_vendor: str = "deepgram"
+    # Orchestrator-only in CAI mode, so match Julian's in-process voice
+    # (aura-2-draco-en, British male baritone) — a female voice narrating felt off.
+    cai_tts_model: str = "aura-2-draco-en"
 
     # Speech providers
     sarvam_api_key: str = ""

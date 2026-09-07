@@ -21,7 +21,8 @@ import shutil
 import time
 import uuid
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -33,6 +34,8 @@ from shared import ask_panel, dossier as dossier_mod, gemini, prompts, scoring, 
 from agora_session import AgoraSession
 from pipeline import InterviewPipeline
 from ask_pipeline import AskPipeline
+import cai_agent
+import cai_llm
 
 _LOG_FMT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=_LOG_FMT)
@@ -103,6 +106,7 @@ _ask_pipeline: AskPipeline | None = None   # voice Ask the Panel (Phase 6)
 _report: InterviewReport | None = None   # last locked report (Phase 5)
 _panel_record: ask_panel.PanelRecord | None = None   # for Ask the Panel (Phase 6)
 _dossier: Dossier | None = None          # active interview's dossier (Phase 7)
+_cai_agent_id: str | None = None         # running Agora Conversational AI agent (§CAI)
 
 
 class StartRequest(BaseModel):
@@ -460,7 +464,7 @@ def panel_join(req: JoinRequest | None = None):
 
     With an `interview_id`, revives that stored interview (dashboard rejoin);
     otherwise uses the interview just concluded in this process."""
-    global _session, _pipeline, _ask_pipeline, _panel_record
+    global _session, _pipeline, _ask_pipeline, _panel_record, _cai_agent_id
     req = req or JoinRequest()
     if req.interview_id and (_panel_record is None
                              or _panel_record.interview_id != req.interview_id):
@@ -474,12 +478,43 @@ def panel_join(req: JoinRequest | None = None):
 
     _teardown()  # the interview is over; reclaim the single AgoraService
 
-    channel = f"ask-{_panel_record.interview_id[:8]}"
-    bot_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
-                                channel, BOT_UID, TOKEN_TTL_SECONDS)
+    # Unique channel per join. A CAI agent lives in Agora's cloud and outlives our
+    # container, so a leftover agent on a fixed channel name causes a 409 Conflict
+    # on rejoin (we'd have lost its agent_id across a restart). A fresh channel each
+    # time sidesteps that entirely — the browser joins whatever channel we return.
+    channel = f"ask-{_panel_record.interview_id[:8]}-{int(time.time()) % 100000}"
     recruiter_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
                                       channel, RECRUITER_UID, TOKEN_TTL_SECONDS)
 
+    # Preferred path: Agora Conversational AI Engine. When REST creds + a public
+    # callback URL are configured, a managed CAI agent runs the whole voice loop
+    # in the channel — Deepgram ASR → OUR grounded brain (the /cai/llm endpoint
+    # below) → Deepgram TTS — instead of our in-process AskPipeline.
+    if cai_agent.enabled(settings):
+        agent_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
+                                      channel, BOT_UID, TOKEN_TTL_SECONDS)
+        rec = _panel_record.report.conclusion.recommendation.replace("_", " ").lower()
+        greeting = (f"Welcome back. The panel concluded: {rec}. Ask me anything about "
+                    "the candidate, or tell me to override the recommendation.")
+        system_prompt = ("You are the interview panel's spokesperson, answering a "
+                         "recruiter's questions grounded strictly in the locked record.")
+        llm_path = f"/cai/llm/{_panel_record.interview_id}/chat/completions"
+        try:
+            _cai_agent_id = cai_agent.start_agent(
+                settings, channel=channel, token=agent_token, agent_uid=BOT_UID,
+                remote_uid=RECRUITER_UID, llm_path=llm_path, system_prompt=system_prompt,
+                greeting=greeting, name=f"panel-{_panel_record.interview_id[:8]}")
+            logger.info("panel voice session via Agora CAI on channel %s (agent=%s)",
+                        channel, _cai_agent_id)
+            return SessionStartResponse(app_id=settings.agora_app_id, channel=channel,
+                                        uid=RECRUITER_UID, token=recruiter_token)
+        except Exception:
+            logger.exception("Agora CAI join failed — falling back to in-process AskPipeline")
+            _cai_agent_id = None
+
+    # Fallback: in-process pipeline (no CAI creds configured, or CAI unreachable).
+    bot_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
+                                channel, BOT_UID, TOKEN_TTL_SECONDS)
     session = AgoraSession(app_id=settings.agora_app_id, channel=channel,
                            bot_uid=BOT_UID, token=bot_token, sample_rate=settings.audio_sample_rate)
     ask = AskPipeline(session=session, settings=settings, record=_panel_record,
@@ -488,9 +523,34 @@ def panel_join(req: JoinRequest | None = None):
     session.start()
     ask.start()
     _session, _ask_pipeline = session, ask
-    logger.info("panel voice session started on channel %s", channel)
+    logger.info("panel voice session started on channel %s (in-process)", channel)
     return SessionStartResponse(app_id=settings.agora_app_id, channel=channel,
                                 uid=RECRUITER_UID, token=recruiter_token)
+
+
+@app.post("/cai/llm/{interview_id}/chat/completions")
+async def cai_llm_chat(interview_id: str, request: Request):
+    """Custom OpenAI-compatible LLM endpoint for the Agora Conversational AI agent.
+
+    CAI does ASR and POSTs the recruiter's turn here as an OpenAI chat-completions
+    request (stream=true). We run the grounded Ask-the-Panel brain over the locked
+    record and stream the answer back as SSE — CAI turns it into speech. This is
+    the seam that keeps OUR intelligence inside Agora's managed voice loop."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    messages = body.get("messages", [])
+    record = _panel_record
+    if record is None or record.interview_id != interview_id:
+        record = store.load_record(interview_id)
+    if record is None:
+        raise HTTPException(404, "interview not found")
+    return StreamingResponse(
+        cai_llm.stream_panel_answer(record, messages, get_settings(),
+                                    interview_id, on_event=_broker.publish),
+        media_type="text/event-stream",
+    )
 
 
 @app.post("/panel/ask", response_model=AskAnswer)
@@ -569,7 +629,10 @@ def session_stop():
 
 
 def _teardown():
-    global _session, _pipeline, _ask_pipeline
+    global _session, _pipeline, _ask_pipeline, _cai_agent_id
+    if _cai_agent_id is not None:
+        cai_agent.stop_agent(get_settings(), _cai_agent_id)
+        _cai_agent_id = None
     if _pipeline is not None:
         _pipeline.stop()
         _pipeline = None

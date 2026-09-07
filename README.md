@@ -86,7 +86,10 @@ required anyway — browsers only grant mic access over https (localhost aside).
 
 ---
 
-## Running Phase 1
+## Running the app
+
+Follow these steps in order. Steps 3 and 4 must both be running for the app to
+work — the Cloudflare tunnel (step 3) and the Docker worker (step 4).
 
 ### 1. Add your API keys
 
@@ -105,6 +108,9 @@ You need these keys in `.env`:
 | `DEEPGRAM_API_KEY` | Deepgram console |
 | `OPENROUTER_API_KEY` | OpenRouter dashboard (new in Phase 2 — the interviewer's brain) |
 | `GROQ_API_KEY` | Groq console (optional — makes the fast path sub-second via gpt-oss-120b; without it the router uses free OpenRouter models) |
+| `GEMINI_API_KEY` | Google AI Studio — powers the live screen-watch coding round |
+| `AGORA_CUSTOMER_ID` + `AGORA_CUSTOMER_SECRET` | Agora Console → **RESTful API** → Add a Secret — required for the Ask-the-Panel Conversational AI agent (step 3) |
+| `PUBLIC_BASE_URL` | Your Cloudflare tunnel URL — required for the Ask-the-Panel Conversational AI agent (step 3 sets this) |
 
 ### 2. Get the Smart Turn weights (optional but recommended)
 
@@ -115,7 +121,44 @@ python models/download_smart_turn.py
 Without it the interview still runs; it just treats every pause as end-of-turn.
 See [models/README.md](models/README.md).
 
-### 3. Build and run the media worker
+### 3. Start the Cloudflare tunnel
+
+The recruiter **"Ask the Panel"** feature runs through the **Agora Conversational
+AI (CAI) Engine** — a managed cloud agent that joins the channel and runs the
+whole voice loop (**Deepgram ASR → our grounded LLM → Deepgram TTS**, with
+semantic turn-detection). That code lives in
+[media-worker/cai_agent.py](media-worker/cai_agent.py) (the agent `join`/config
+call) and the custom OpenAI-compatible LLM endpoint in
+[media-worker/main.py](media-worker/main.py) (`/cai/llm/{interview_id}/chat/completions`).
+
+Because the CAI agent runs in Agora's cloud, it must reach your worker over a
+public HTTPS URL — so you run a Cloudflare tunnel. Install
+[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+(`brew install cloudflared` on macOS), then:
+
+```bash
+cloudflared tunnel --protocol http2 --url http://localhost:8080
+```
+
+It prints a line like:
+
+```
+https://<random-words>.trycloudflare.com
+```
+
+Copy that URL into `.env` as `PUBLIC_BASE_URL` (no trailing slash) — this is
+**your** tunnel, don't reuse anyone else's:
+
+```
+PUBLIC_BASE_URL=https://<random-words>.trycloudflare.com
+```
+
+**Leave this terminal running** the whole time you use the app. If you restart the
+tunnel you get a new URL — update `PUBLIC_BASE_URL` and restart the worker (step 4).
+
+### 4. Build and run the media worker
+
+In a **separate** terminal:
 
 ```bash
 docker compose up --build
@@ -124,15 +167,21 @@ docker compose up --build
 First build downloads torch + the Agora SDK, so it takes a few minutes. When it's
 up you'll see `Uvicorn running on http://0.0.0.0:8080`.
 
-### 4. Open the page
+### 5. Open the page
 
-Go to **http://localhost:8080** in your browser. Click **Join Interview** and
-allow the microphone. The interviewer greets you and asks a question — answer,
-then pause. Try talking over it to interrupt.
+Go to **http://localhost:8080** in your browser.
+
+- **Run an interview:** click **Join Interview** and allow the mic + camera. The
+  panel greets you and asks questions — answer, then pause. Try talking over it to
+  interrupt. When done, **Finish & score**.
+- **Ask the Panel (Conversational AI):** open a scored interview and click **Ask
+  the Panel**. A CAI agent joins and answers your spoken questions in the
+  orchestrator's voice — you can also say "override and accept/decline the
+  candidate". In the logs you'll see `CAI: agent started id=… status=RUNNING`.
 
 Watch the container logs (`docker compose` output) to see each stage:
 `candidate turn → Smart Turn p(complete)=… → heard: '…' → Hiring Manager speaks`
-(and `INTERRUPTED: …` when you barge in).
+(and `INTERRUPTED: …` when you barge in), and `CAI: …` lines during Ask the Panel.
 
 ---
 
