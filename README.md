@@ -1,88 +1,76 @@
 # 968ms — Coordinated AI Interview Panel
 
-An adaptive AI interview panel. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
+An adaptive, voice-based AI interview panel. A candidate joins a live call and is
+interviewed by a coordinated panel of AI interviewers; afterwards a recruiter can
+talk to the panel to interrogate the decision. Built on **Agora** for real-time
+audio, including the **Agora Conversational AI Engine** for the recruiter Q&A.
 
-This repo is being built **phase by phase**. Current status: **Phase 3 — The panel.**
-
-Five AI interviewers (Maya · Ethan · Sophia · Nina · Liam) with distinct prompts
-and voices, a silent Orchestrator that opens the session, parallel bid calls each
-turn, and **deterministic floor control** (`priority = interest × (1+λ·gap) ×
-recency`) that picks who speaks. The React candidate room shows five tiles and
-lights up whoever's talking (speaker signals over a WebSocket), with live
-captions, a push-to-talk Interrupt button, and Agora AI noise suppression on the
-mic. Verified: a technically-correct answer with no customer impact routes to
-Product (the PS11 scenario).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
 
 ---
 
-## Phase 2: what works
+## What it does
 
-You open a web page and join. A real interviewer (the Hiring Manager) greets you,
-discloses that it's AI, and asks an opening question. You answer out loud; it
-listens, decides you're actually done (not just pausing mid-thought), and asks a
-natural follow-up. You can **talk over it to interrupt** — it stops immediately
-and the record notes exactly how much of its question you actually heard.
+**The interview.** The candidate joins a web page (mic + camera) and is greeted by
+a host who discloses that the panel is AI. Up to five specialized interviewers —
+hiring manager, technical, product, customer advocate, and a coding interviewer —
+take turns based on **deterministic floor control**: each turn, all interviewers
+bid in parallel and the one with the highest priority
+(`interest × (1 + λ·coverage_gap) × recency`) gets the floor, so questioning chases
+whatever the panel still doesn't know. The candidate can talk over an interviewer
+to interrupt; the record notes exactly how much was actually heard.
+
+**The coding round.** The coding interviewer runs a short live exercise: the
+candidate shares their screen and a vision model (Gemini Live) watches in real
+time, giving feedback and flagging outside AI help.
+
+**Scoring.** Each interviewer scores privately and independently; the scores lock,
+the panel debates, and a final recommendation is produced with a full evidence
+ledger — every claim tied to the turn it came from.
+
+**Ask the Panel.** After scoring, a recruiter joins by voice and simply talks to
+the panel about the candidate — grounded strictly in the locked record. This runs
+through the **Agora Conversational AI Engine**: a managed cloud agent handles the
+whole voice loop (Deepgram ASR → our grounded LLM → Deepgram TTS) with semantic
+turn-detection. The recruiter can also override the recommendation by voice.
+
+## How the audio pipeline works
 
 ```
-your mic → Agora → media worker → Silero VAD → Smart Turn v3.1 → Sarvam STT
-                                                                      ↓
-                                                              transcript turn
-                                                                      ↓
-        speaker ← Agora ← media worker ← Deepgram Aura TTS ← LLM (gpt-oss)
+candidate mic → Agora → media worker → Silero VAD → Smart Turn v3.1 → Sarvam STT
+                                                                          ↓
+                                                                  transcript turn
+                                                                          ↓
+        speaker ← Agora ← media worker ← Deepgram Aura TTS ← LLM (panel brain)
 ```
 
-- **Smart Turn v3.1** classifies each pause as complete/incomplete, so a short
-  VAD stop doesn't cut people off mid-sentence.
-- **One LLM interviewer** with a system persona, driven through the shared LLM
-  router (`shared/llm_router.py`) with a fallback chain.
-- **Interruption + truncation:** barge-in stops playback and marks the agent's
-  transcript turn `truncated` at the character actually delivered, plus an audit
-  event — so a later "what did it ask?" cites what was heard, not what was
-  generated.
+Every model call goes through a shared LLM router with a cross-provider fallback
+chain (Groq `gpt-oss-120b` for the sub-second fast path, OpenRouter for reasoning).
 
-### Phase 1: what worked
+## Tech stack
 
-The audio spine (mic → VAD → STT → TTS → speaker) — an echo bot, no LLM. Phase 2
-keeps that spine and puts a brain on it.
-
-### Why Docker?
-
-Agora's server-side audio SDK only ships Linux/macOS binaries — it can't run on
-native Windows. So the **media worker** runs in a Linux container. Your browser
-still runs natively on Windows. Everything else (config, tokens) is plain Python.
-
----
+- **Real-time audio:** Agora RTC (candidate/interview) + Agora Conversational AI
+  Engine (recruiter Ask-the-Panel).
+- **Speech:** Silero VAD, Smart Turn v3.1 (end-of-turn), Sarvam STT, Deepgram Aura
+  TTS.
+- **Vision (coding round):** Gemini Live.
+- **LLMs:** Groq + OpenRouter, via a shared router.
+- **Backend:** Python FastAPI media worker (Linux container).
+- **Frontend:** React + Vite, served by the worker.
 
 ## Layout
 
 ```
-media-worker/   FastAPI app: Agora join, VAD, Smart Turn, STT, TTS, panel turn loop (Docker)
-web/            React + Vite candidate room (src/App.jsx). Built to web/dist,
-                which the media worker serves at "/".
-shared/         Config, tokens, models, prompts (agents), competencies,
-                orchestrator (floor control + parallel bids), LLM router
+media-worker/   FastAPI app: Agora join, VAD, Smart Turn, STT, TTS, panel loop,
+                coding round, and the Agora Conversational AI integration (Docker)
+web/            React + Vite candidate & recruiter UI (built to web/dist, served at "/")
+shared/         Config, Agora tokens, models, prompts (agents), orchestrator
+                (floor control + parallel bids), LLM router, scoring, Ask-the-Panel
 models/         Downloaded ONNX weights (Smart Turn)
 ```
 
-## Frontend (React + Vite)
-
-The candidate room is a Vite React app in `web/`. Two ways to run it:
-
-- **Full app (what evaluators run):** `docker compose up --build`. The Docker
-  build compiles the React app and the worker serves it — open
-  **http://localhost:8080**. One origin, one command.
-- **Live frontend dev:** run the backend in Docker (above) and, separately,
-  `cd web && npm install && npm run dev`. Vite serves the app on **:5173** with
-  hot reload and proxies the API + events WebSocket to the worker on :8080.
-
-## Deploying (one repo, one URL)
-
-The media worker must run as a long-lived Linux container (Agora's native SDK +
-torch/ONNX models), so it can't go on Vercel/Netlify. The clean pattern: the
-worker serves the built React app **and** the API from one origin, so you deploy
-**one container** to Render / Railway / Fly.io (or a VM) and get a single HTTPS
-URL. Needs ≥1–2 GB RAM, WebSocket support, and the API keys as env vars. HTTPS is
-required anyway — browsers only grant mic access over https (localhost aside).
+The media worker runs in a **Linux container** because Agora's server-side audio
+SDK ships Linux/macOS binaries only. Your browser runs natively.
 
 ---
 
@@ -104,57 +92,40 @@ You need these keys in `.env`:
 | Key | Where to get it |
 |---|---|
 | `AGORA_APP_ID` + `AGORA_APP_CERTIFICATE` | Agora Console → your project (enable the App Certificate under Security) |
-| `SARVAM_API_KEY` | Sarvam dashboard |
-| `DEEPGRAM_API_KEY` | Deepgram console |
-| `OPENROUTER_API_KEY` | OpenRouter dashboard (new in Phase 2 — the interviewer's brain) |
-| `GROQ_API_KEY` | Groq console (optional — makes the fast path sub-second via gpt-oss-120b; without it the router uses free OpenRouter models) |
-| `GEMINI_API_KEY` | Google AI Studio — powers the live screen-watch coding round |
-| `AGORA_CUSTOMER_ID` + `AGORA_CUSTOMER_SECRET` | Agora Console → **RESTful API** → Add a Secret — required for the Ask-the-Panel Conversational AI agent (step 3) |
-| `PUBLIC_BASE_URL` | Your Cloudflare tunnel URL — required for the Ask-the-Panel Conversational AI agent (step 3 sets this) |
+| `AGORA_CUSTOMER_ID` + `AGORA_CUSTOMER_SECRET` | Agora Console → **RESTful API** → Add a Secret (used by the Ask-the-Panel Conversational AI agent) |
+| `SARVAM_API_KEY` | Sarvam dashboard (speech-to-text) |
+| `DEEPGRAM_API_KEY` | Deepgram console (text-to-speech) |
+| `OPENROUTER_API_KEY` | OpenRouter dashboard |
+| `GROQ_API_KEY` | Groq console (the sub-second fast path) |
+| `GEMINI_API_KEY` | Google AI Studio (the live screen-watch coding round) |
+| `PUBLIC_BASE_URL` | Your Cloudflare tunnel URL — set in step 3 |
 
-### 2. Get the Smart Turn weights (optional but recommended)
+### 2. Get the Smart Turn weights
 
 ```bash
 python models/download_smart_turn.py
 ```
 
-Without it the interview still runs; it just treats every pause as end-of-turn.
-See [models/README.md](models/README.md).
-
 ### 3. Start the Cloudflare tunnel
 
-The recruiter **"Ask the Panel"** feature runs through the **Agora Conversational
-AI (CAI) Engine** — a managed cloud agent that joins the channel and runs the
-whole voice loop (**Deepgram ASR → our grounded LLM → Deepgram TTS**, with
-semantic turn-detection). That code lives in
-[media-worker/cai_agent.py](media-worker/cai_agent.py) (the agent `join`/config
-call) and the custom OpenAI-compatible LLM endpoint in
-[media-worker/main.py](media-worker/main.py) (`/cai/llm/{interview_id}/chat/completions`).
-
-Because the CAI agent runs in Agora's cloud, it must reach your worker over a
-public HTTPS URL — so you run a Cloudflare tunnel. Install
+The **Ask the Panel** agent runs in Agora's cloud (the Conversational AI Engine),
+so it must reach your worker over a public HTTPS URL. Install
 [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-(`brew install cloudflared` on macOS), then:
+(`brew install cloudflared` on macOS), then run:
 
 ```bash
 cloudflared tunnel --protocol http2 --url http://localhost:8080
 ```
 
-It prints a line like:
-
-```
-https://<random-words>.trycloudflare.com
-```
-
-Copy that URL into `.env` as `PUBLIC_BASE_URL` (no trailing slash) — this is
-**your** tunnel, don't reuse anyone else's:
+It prints a URL like `https://<random-words>.trycloudflare.com`. Copy it into
+`.env` as `PUBLIC_BASE_URL` (no trailing slash — this is **your** tunnel):
 
 ```
 PUBLIC_BASE_URL=https://<random-words>.trycloudflare.com
 ```
 
-**Leave this terminal running** the whole time you use the app. If you restart the
-tunnel you get a new URL — update `PUBLIC_BASE_URL` and restart the worker (step 4).
+**Leave this terminal running** while you use the app. Restarting the tunnel gives
+a new URL — update `PUBLIC_BASE_URL` and restart the worker (step 4).
 
 ### 4. Build and run the media worker
 
@@ -164,42 +135,27 @@ In a **separate** terminal:
 docker compose up --build
 ```
 
-First build downloads torch + the Agora SDK, so it takes a few minutes. When it's
-up you'll see `Uvicorn running on http://0.0.0.0:8080`.
+The first build downloads torch + the Agora SDK, so it takes a few minutes. When
+it's ready you'll see `Uvicorn running on http://0.0.0.0:8080`.
 
-### 5. Open the page
+### 5. Open the app
 
-Go to **http://localhost:8080** in your browser.
+Go to **http://localhost:8080**.
 
 - **Run an interview:** click **Join Interview** and allow the mic + camera. The
-  panel greets you and asks questions — answer, then pause. Try talking over it to
-  interrupt. When done, **Finish & score**.
-- **Ask the Panel (Conversational AI):** open a scored interview and click **Ask
-  the Panel**. A CAI agent joins and answers your spoken questions in the
-  orchestrator's voice — you can also say "override and accept/decline the
-  candidate". In the logs you'll see `CAI: agent started id=… status=RUNNING`.
+  panel greets you and asks questions — answer, then pause. Talk over an
+  interviewer to interrupt. When done, click **Finish & score**.
+- **Ask the Panel:** open a scored interview and click **Ask the Panel**. The
+  Conversational AI agent joins and answers your spoken questions about the
+  candidate. You can also say *"override and accept the candidate"* (or decline).
 
-Watch the container logs (`docker compose` output) to see each stage:
-`candidate turn → Smart Turn p(complete)=… → heard: '…' → Hiring Manager speaks`
-(and `INTERRUPTED: …` when you barge in), and `CAI: …` lines during Ask the Panel.
+### Where the CAI integration lives
 
----
-
-## Notes / decisions
-
-- **"Flux" vs "Aura":** the architecture doc calls the TTS "Deepgram Flux", but
-  Deepgram's TTS product is actually **Aura** (`aura-2-thalia-en`). "Flux" is
-  their STT turn model. We use Aura; the voice name lives in [media-worker/tts.py](media-worker/tts.py).
-- **One session per process** still. Multi-tenant workers come later.
-- **LLM routing:** every model call goes through `shared/llm_router.py` with a
-  cross-provider fallback chain — never hardcode a model id at a call site. Model
-  ids carry a provider prefix (`groq:` / `openrouter:`; unprefixed = OpenRouter).
-  The fast path is `groq:openai/gpt-oss-120b` (sub-second); until a `GROQ_API_KEY`
-  is set the router falls through to free OpenRouter models automatically. Prompts
-  are built in one place, `shared/prompts.build_agent_prompt`.
-- **The panel** (five interviewers, voices, floor control) arrives in **Phase 3**.
-- **Frontend is still vanilla HTML on purpose.** The architecture calls for React,
-  and it arrives in **Phase 3** — that's where the UI first has real state (five
-  tiles, active-speaker highlight via RTM, captions). Through Phase 2 the page is
-  just join + mic, so React would be ceremony with nothing to manage. Don't
-  convert it early.
+- [media-worker/cai_agent.py](media-worker/cai_agent.py) — creates/starts the
+  Agora Conversational AI cloud agent (the `join` REST call) and configures ASR,
+  the custom LLM, and TTS.
+- [media-worker/cai_llm.py](media-worker/cai_llm.py) — the custom
+  OpenAI-compatible LLM the CAI agent calls: runs the grounded panel brain and
+  streams the answer back.
+- [media-worker/main.py](media-worker/main.py) — `/panel/join` starts the agent;
+  `/cai/llm/{interview_id}/chat/completions` is the endpoint the agent calls.
