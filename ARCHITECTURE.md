@@ -11,120 +11,90 @@ and invariants — not code.
 
 ## 0. Stack and layout
 
-**Backend: Python + FastAPI.** Both server components are FastAPI apps. Python is
-the right call here because Silero VAD and Smart Turn v3.1 both ship Python ONNX
-inference, and Agora has a Python server SDK — the media worker needs all three
-in one process.
+**Backend: Python + FastAPI**, one process and one active session. LiveKit Agents
+runs on a dedicated asyncio loop; serialized domain workers run the existing
+panel bidding, coding, evidence and Q&A logic. Blocking provider calls do not
+block inbound audio. Scoring and provider configuration remain in `shared/`.
 
-**Frontend: React.** Candidate room and recruiter dashboard, using the Agora Web
-SDK for audio and RTM for speaker signals.
+**Frontend: React + Vite**, using `livekit-client` for audio and camera and the
+existing events WebSocket for speaker signals, captions and evidence. The built
+frontend is served from `web/dist` by FastAPI.
 
 ```
-media-worker/     FastAPI. One process per interview. Agora, VAD,
-                  Smart Turn, Sarvam STT, Deepgram Flux TTS.
-orchestrator/     FastAPI. OpenAI-compatible endpoint, floor control,
-                  ledger, lock/debate/conclusion, Ask the Panel.
-api/              FastAPI. Interviews CRUD, reports, overrides, auth.
-web/              React. Candidate room + recruiter dashboard.
-shared/           Pydantic models, prompt builder, LLM router, DB layer.
-models/           Downloaded ONNX weights (Silero, Smart Turn).
+media-worker/     FastAPI, embedded LiveKit AgentSession, interview and Q&A workers
+web/              React candidate room and recruiter dashboard
+shared/           Room tokens, named-speaker routing, agents/prompts, bidding,
+                  scoring, dossiers, LLM routing, JSON record persistence
 ```
 
 `shared/` matters more than it looks. The prompt builder and the LLM router both
 live there, and both are enforcement points for invariants in §13 — keep them in
-one place that every service imports.
+one place the app imports.
 
 ---
 
 ## 1. The one idea that shapes everything
 
-**Agora carries audio. The agents live on our server.**
+**LiveKit carries audio. The panel brains live on our server.**
 
-There is exactly **one** bot participant in the Agora channel. It has no LLM, no
-memory and no opinions. It is an ear and a mouth: it receives candidate audio and
-publishes synthesised speech.
+One `panel` RTC participant publishes the serialized floor. Five interviewer
+personas and Julian each have an isolated prompt and a distinct Deepgram TTS
+plugin instance. Selecting an addressee selects both the grounded answer and the
+voice. The same transport is used for the interview and Ask the Panel.
 
-The five interviewers are **not** RTC participants. They are five isolated LLM
-contexts on our server. The candidate sees five tiles because our own frontend
-draws five tiles and highlights whichever one is currently speaking, driven by an
-RTM signal.
+The listening `AgentSession` uses streaming Deepgram STT, bundled Silero VAD and
+`inference.TurnDetector(version="v1-mini")`. It calls the domain worker on a
+completed user turn; it has no second automatic LLM response. The worker passes
+the chosen persona's streaming audio to `AgentSession.say()`. LiveKit owns
+playout, interruptions and transcript truncation. The mini audio model runs
+locally in Docker and is not the deprecated text turn-detector plugin.
 
-Consequences:
-
-- 1× RTC minutes instead of 5×
-- Agents cannot hear each other, because they were never in the room
-- Turn-taking is trivial — we own the single outbound audio stream
-- Voice identity is a TTS parameter, not an infrastructure concern
-
-### Portability requirement
-
-The Orchestrator **must** expose an OpenAI-compatible `POST /v1/chat/completions`
-endpoint. This is non-negotiable and costs almost nothing to honour.
-
-It means we can run on plain Agora RTC (free, unlimited testing) during
-development, and optionally switch to Agora Conversational AI Engine for demo day
-— which would hand us their VAD, turn detection and interruption handling — by
-pointing ConvAI's custom-LLM setting at the same endpoint. Same orchestrator code
-either way. Decide later, never rewrite.
+BVC is applied once on inbound audio and requires LiveKit Cloud. Self-hosted
+rooms use `LIVEKIT_NOISE_CANCELLATION=off`. The browser retains echo cancellation
+and disables its noise suppression when server BVC/NC is configured.
 
 ---
 
 ## 2. Components
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ WEB CLIENT                                                    │
-│  · candidate room: 5 interviewer tiles, captions, screen share│
-│  · recruiter dashboard: results, "Join session" button        │
-└───────────────┬───────────────────────────┬──────────────────┘
-                │ Agora RTC (audio)         │ HTTPS
-                │ Agora RTM (signals)       │
-┌───────────────▼───────────────┐   ┌───────▼──────────────────┐
-│ MEDIA WORKER (1 per interview)│   │ API / DASHBOARD SERVICE   │
-│  · joins Agora channel        │   │  · interviews CRUD        │
-│  · Silero VAD                 │   │  · reports               │
-│  · Smart Turn v3.1            │   │  · overrides, audit       │
-│  · Sarvam STT (streaming)     │   └───────┬──────────────────┘
-│  · Deepgram Flux TTS          │           │
-│  · publishes one audio track  │           │
-└───────────────┬───────────────┘           │
-                │ HTTP                       │
-┌───────────────▼───────────────────────────▼──────────────────┐
-│ ORCHESTRATOR SERVICE                                          │
-│  · OpenAI-compatible endpoint                                 │
-│  · bid collection + floor control                             │
-│  · coverage map + time budget                                 │
-│  · evidence ledger writes                                     │
-│  · lock / debate / conclusion                                 │
-│  · Ask the Panel session revival                              │
-└───────────────┬───────────────────────────┬──────────────────┘
-                │                            │
-┌───────────────▼──────────────┐   ┌────────▼──────────────────┐
-│ AGENT LAYER (stateless)      │   │ STORAGE                    │
-│  · 5 evaluators + chair      │   │  · Postgres (durable)      │
-│  · prompt builder (isolation)│   │  · Redis (live turn state) │
-│  · LLM router + fallbacks    │   │  · object store (audio)    │
-└──────────────────────────────┘   └───────────────────────────┘
+Browser (LiveKit room audio/video + HTTP/events)
+  ↕
+FastAPI worker
+  ├─ LiveKitSession: BVC, Silero, Deepgram STT, v1-mini, persona TTS
+  ├─ InterviewPipeline: bids, deterministic floor, evidence, coding
+  ├─ AskPipeline: named/sticky routing, locked-record answers, overrides
+  └─ shared: LLM router, prompts, independent scoring, JSON records
 ```
+
+The optional browser Gemini Live coding session still receives screen frames
+and supplies its coding assessment. The LiveKit microphone is muted while that
+session owns the coding round. No public custom-LLM callback or tunnel is needed
+for local voice sessions.
 
 ### Model routing
 
 | Job | Frequency | Latency | Model |
 |---|---|---|---|
-| Bids + claim extraction | every turn, ×5 parallel | critical | `openai/gpt-oss-120b` |
-| Question generation | every turn | critical | `openai/gpt-oss-120b` |
-| Final scoring | once, ×5 | none | `nvidia/nemotron-3-ultra-550b-a55b` |
-| Debate statements | once, ×5 | none | Nemotron 3 Ultra |
-| Orchestrator conclusion | once | none | Nemotron 3 Ultra |
-| Ask the Panel replies | on demand | ~1s | `gpt-oss-120b` |
-| Counterfactual re-score | on demand | ~2s | Nemotron 3 Ultra |
+| Bids + claim extraction | every turn, ×5 parallel | critical | `groq:openai/gpt-oss-120b` |
+| Question generation | every turn | critical | `groq:openai/gpt-oss-120b` |
+| Audio endpointing | each speech pause | critical | LiveKit `v1-mini` (local CPU) |
+| Coding round (screen-watch) | live, coding round | streaming | Gemini Live (`gemini-flash-live`) |
+| Final scoring | once, ×5 | none | `openrouter:minimax/minimax-m3` |
+| Debate statements | once, ×5 | none | MiniMax M3 |
+| Orchestrator conclusion | once | none | MiniMax M3 |
+| Ask the Panel replies | on demand | ~1s | `groq:openai/gpt-oss-120b` |
+| Counterfactual re-score | on demand | ~2s | MiniMax M3 |
 
 Rule: **fast model where the candidate is waiting, deep model where the decision
-is made.**
+is made.** The fast path is Groq's `gpt-oss-120b` (sub-second); scoring/debate/
+conclusion use a larger reasoning model (MiniMax M3) via OpenRouter, where latency
+doesn't matter because the candidate has left.
 
-Every LLM call goes through one router module with a fallback chain
-(`primary → secondary → openrouter/free`). Free model IDs rotate without notice;
-never hardcode a single ID at a call site.
+Every LLM call goes through one router module (`shared/llm_router.py`) with a
+cross-provider fallback chain. The fast path round-robins across a pool of Groq
+keys to spread the per-account rate limit. Model IDs carry a provider prefix
+(`groq:` / `openrouter:`); never hardcode a single ID at a call site.
 
 ### The Orchestrator is a service, not a single model
 
@@ -139,8 +109,8 @@ claim.
 | Tie-breaking, recency penalties | code |
 | Choosing who speaks | code |
 | Writing audit events | code |
-| Reading the debate, writing the conclusion | Nemotron |
-| Answering in Ask the Panel | gpt-oss; Nemotron for counterfactuals |
+| Reading the debate, writing the conclusion | MiniMax M3 |
+| Answering in Ask the Panel | gpt-oss; MiniMax M3 for counterfactuals |
 
 Turn-taking being deterministic is the point: we can show the exact five numbers
 behind every floor grant and the formula that picked the winner. An LLM router
@@ -218,19 +188,19 @@ Ask the Panel answerable and the record defensible.
 
 ```
 1  Candidate speaks
-2  Silero VAD detects speech onset, then a pause (stop_secs = 0.2)
-3  Smart Turn v3.1 classifies the segment: complete or incomplete
-      incomplete → keep listening, no LLM call
-4  Sarvam STT finalises the utterance → write transcript_turn
-5  Fan out 5 bid calls IN PARALLEL, one per interviewer
-6  Orchestrator computes floor priority, picks a winner
-7  Winning agent generates its question
-8  Deepgram Flux streams TTS in that agent's voice
-9  Media worker publishes audio; RTM signal lights the tile
-10 Ledger updated with claims noticed by all five agents
+2  LiveKit cleans inbound audio (BVC) and detects speech with Silero
+3  Deepgram streams interim and final transcripts to LiveKit and the UI
+4  The local v1-mini audio model decides when the turn ends; Done can commit now
+5  Utterance finalised → write transcript_turn
+6  Fan out 5 bid calls IN PARALLEL, one per interviewer
+7  Orchestrator computes floor priority, picks a winner
+8  Winning agent generates its question
+9  Deepgram Aura streams TTS in that agent's voice
+10 Media worker publishes audio; a WebSocket signal lights the tile
+11 Ledger updated with claims noticed by all five agents
 ```
 
-Steps 5 and 10 use the same call. Each bid response returns:
+Steps 6 and 11 use the same call. Each bid response returns:
 
 ```
 { interest: 0.0-1.0,
@@ -243,28 +213,16 @@ Different agents notice different things — Product spots business claims,
 Technical spots failure-mode claims. Five perspectives on one answer is a feature,
 not duplication.
 
-### Latency budget
+### Latency
 
-| Stage | Target |
-|---|---|
-| Smart Turn decision | 15 ms |
-| STT finalisation | 150 ms |
-| 5 parallel bid calls | 400 ms |
-| Question generation | 500 ms |
-| TTS time-to-first-byte | 150 ms |
-| **Total** | **~1.2 s** |
-
-Acceptable — in an interview a short pause reads as the interviewer considering
-the answer. Two optimisations if it feels slow:
-
-- **Speculative bidding.** Fire bid calls on the interim transcript as soon as
-  Smart Turn leans "complete". Discard if the candidate resumes.
-- **Stream TTS.** Start publishing audio on the first sentence rather than
-  waiting for the full question.
+Endpointing, provider generation and first audio should be measured separately.
+The configurable endpointing bounds default to 0.5–4.0 seconds; the model chooses
+whether to wait through a pause. There are no claimed live latency measurements
+for the migrated stack yet. TTS streams as soon as the provider produces audio.
 
 ### Interruption
 
-If VAD detects candidate speech while TTS is playing:
+When LiveKit confirms an interruption (or the user presses Interrupt):
 
 1. Stop pushing TTS audio immediately
 2. Mark the agent's `transcript_turn` as `truncated` with the character offset
@@ -360,9 +318,9 @@ and it is deliberate.
 ## 6. Scoring, locking, debate
 
 Everything in this section runs on the reasoning model —
-`nvidia/nemotron-3-ultra-550b-a55b`, referenced in code as `LLM_REASONING_MODEL`.
-Nothing here is latency-sensitive; the candidate has left. Use the deepest free
-model available and let it take its time.
+`openrouter:minimax/minimax-m3`, referenced in code as `LLM_REASONING_MODEL`.
+Nothing here is latency-sensitive; the candidate has left. Use the deepest
+reasoning model available and let it take its time.
 
 ### Isolation is a code invariant, not a convention
 
@@ -415,7 +373,7 @@ early.
 
 ### Conclusion
 
-One final call, on Nemotron. Input: all five locked scores, all statements, who
+One final call, on MiniMax M3. Input: all five locked scores, all statements, who
 held and who moved, and the coverage map. Output:
 
 - recommendation (`PROCEED | PROCEED_FLAGGED | INSUFFICIENT_SIGNAL | DECLINE`)
@@ -435,20 +393,31 @@ The differentiating feature. It works because nothing is thrown away.
 
 When the recruiter clicks Join:
 
-1. Open a new Agora channel for the recruiter
-2. Rehydrate each agent: system prompt + full transcript + its own final notes +
-   its locked score + its debate statement + the panel conclusion
-3. The Orchestrator persona joins too, with the conclusion and every floor-grant
-   audit event
+1. Open a new LiveKit room for the recruiter
+2. Rehydrate the record: full transcript, every agent's locked score + notes +
+   debate statement, the evidence ledger, and the panel conclusion
+3. Julian greets the recruiter; named interviewers answer in their own voices
 
 Nothing is recomputed. The record is read back exactly as it was locked.
+
+### Voice: LiveKit
+
+`/panel/join` creates a fresh room and a recruiter-scoped token. `AskPipeline`
+uses the same LiveKit transport as the interview. A named question goes to that
+interviewer and voice, while plain follow-ups keep the last addressee. Addressing
+Julian, the host or the whole panel resets that choice. Names and aliases use word
+boundaries, so “through” cannot accidentally match “HR”.
+
+Scores, claims and conclusions remain locked. An absent interviewer explicitly
+says they did not assess the candidate. Spoken override commands are audited and
+persisted separately; questions about rejecting someone do not create overrides.
 
 ### Question routing
 
 Three modes:
 
 - **Addressed** — the UI lets the recruiter pick a target ("ask Product"). Route
-  directly.
+  directly. Voice and typed names also select the target.
 - **Open** — no target. The Orchestrator answers, and may cite a specific agent.
 - **Counterfactual** — recruiter supplies a hypothetical answer at a specific
   turn. Re-run only that agent's scoring for the affected claims, return the
@@ -459,17 +428,17 @@ any number of what-if questions.
 
 ### Which model answers
 
-Most recruiter questions need no new judgment. Nemotron already reasoned at lock
-time, and its conclusion, reasoning and debate statements are stored as text.
-Retrieving and phrasing that is reading comprehension, not judgment — so the fast
-model handles it.
+Most recruiter questions need no new judgment. The reasoning model already reasoned
+at lock time, and its conclusion, reasoning and debate statements are stored as
+text. Retrieving and phrasing that is reading comprehension, not judgment — so the
+fast model handles it.
 
 | Question | Model | Latency |
 |---|---|---|
 | "Why did you recommend X?" | gpt-oss | ~1 s |
 | "What did he say at 11:20?" | gpt-oss | ~1 s |
 | "What was Product's objection?" | gpt-oss | ~1 s |
-| "If he had said X, would that change?" | Nemotron | ~2–3 s |
+| "If he had said X, would that change?" | MiniMax M3 | ~2–3 s |
 
 gpt-oss is a **spokesperson, not a judge**. It reads out a decision that was made
 and recorded hours earlier.
@@ -494,7 +463,7 @@ alongside it.
 
 ## 8. Concurrency and isolation
 
-One interview = one Agora channel + one media worker process + one row set.
+One interview = one LiveKit room + one media worker process + one row set.
 
 - **Partition key is `interview_id`, everywhere.** Every Redis key is
   `iv:{interview_id}:*`. Every Postgres row has the FK. No exceptions.
@@ -503,7 +472,7 @@ One interview = one Agora channel + one media worker process + one row set.
 - **The Orchestrator service is stateless and horizontally scalable.** All live
   turn state lives in Redis; all durable state in Postgres. Any instance can
   serve any request.
-- **Agora channel name derives from `interview_id`.** Tokens are scoped per
+- **LiveKit room name derives from `interview_id`.** Tokens are scoped per
   channel per participant with short TTL, so a leaked token grants nothing
   outside one interview.
 - **LLM rate limits are global**, not per interview. The router needs a shared
@@ -546,12 +515,13 @@ said" without any extra machinery.
 | Free model delisted | Router falls through to next ID; alert on fallback rate |
 | STT drops | Buffer audio, retry; never silently lose a turn |
 | TTS fails | Fall back to on-screen captions; the interview continues |
-| Agora disconnect | Reconnect, resume from Redis turn state |
+| LiveKit disconnect | Reconnect, resume from Redis turn state |
 | Worker crash | Interview marked `INTERRUPTED`; transcript up to that point is preserved and hashable |
 
-**Demo-day rule:** do not run on a free-tier model. Put a small balance on a paid
-model and flip a config flag before presenting. A `:free` endpoint being
-rate-limited mid-demo is a bad way to lose.
+**Demo-day rule:** provision rate-limit headroom on the model providers before
+presenting (a warm key pool for the fast path, sufficient quota for the reasoning
+model), so a provider throttle can't interrupt a live demo — and lean on the
+router's fallback chain if one does.
 
 ---
 
@@ -561,18 +531,18 @@ Each phase ends in something demoable. Do not start a phase before the previous
 one runs end to end.
 
 **Phase 1 — Audio spine.**
-Web client joins an Agora channel. Media worker joins, receives audio, runs Silero
-VAD, transcribes with Sarvam, synthesises a hardcoded reply with Flux, publishes
-it back. No LLM. Success: you speak, it echoes back in a synthetic voice.
+Web client joins an LiveKit room. Media worker joins, receives audio, runs Silero
+VAD, transcribes with Deepgram, synthesises a hardcoded reply with Deepgram Aura,
+publishes it back. No LLM. Success: you speak, it echoes back in a synthetic voice.
 
 **Phase 2 — One interviewer.**
-Add Smart Turn v3.1 and one LLM-backed interviewer with a system prompt. Add
+Add LiveKit v1-mini and one LLM-backed interviewer with a system prompt. Add
 interruption handling with truncation logging. Success: a real, interruptible
 one-on-one voice interview.
 
 **Phase 3 — The panel.**
 Five agents with distinct prompts and voices. Parallel bid calls. Floor control
-with the priority formula. Prompt-builder isolation invariant. RTM speaker
+with the priority formula. Prompt-builder isolation invariant. WebSocket speaker
 signals and five tiles in the UI. Success: the PS11 example scenario works — a
 technically correct answer with no customer impact routes to Product.
 
@@ -595,52 +565,64 @@ JD and resume upload, competency seeding, panel auto-composition, rubric
 generation, resume claims as UNVERIFIED entries.
 
 **Phase 8 — Polish.**
-Coding interviewer with screen-share frames into a vision model. Confidence
-trajectory chart. Spoken AI disclosure and persistent badge. Recruiter dashboard.
+Coding interviewer running a live task with **Gemini Live** watching the shared
+screen in real time (feedback + outside-AI-help detection). Confidence trajectory
+chart. Spoken AI disclosure and persistent badge. Recruiter dashboard. Mandatory
+camera, mic toggle, live captions, and per-session logging.
 
-Phases 1–6 are the product. Phases 7–8 are what make it a demo people remember.
+**Phase 9 — LiveKit migration.**
+Both voice flows run on LiveKit with named persona voices, BVC and local v1-mini
+turn detection. The migration branch removes the previous RTC/CAI stack from the
+Docker image; the existing main branch retains it for rollback.
+
+Phases 1–6 are the product. Phases 7–9 are what make it a demo people remember.
 
 ---
 
 ## 12. Configuration
 
 ```
-AGORA_APP_ID, AGORA_APP_CERTIFICATE
-SARVAM_API_KEY
-DEEPGRAM_API_KEY
-OPENROUTER_API_KEY
-LLM_FAST_MODEL          openai/gpt-oss-120b
-LLM_REASONING_MODEL     nvidia/nemotron-3-ultra-550b-a55b
+LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET # room connection / server token signing
+LIVEKIT_NOISE_CANCELLATION bvc                 # Cloud only; nc or off also supported
+DEEPGRAM_API_KEY                              # streaming STT + per-persona Aura TTS
+LIVEKIT_STT_MODEL nova-3
+LIVEKIT_STT_LANGUAGE en-US
+LIVEKIT_ENDPOINTING_MIN_DELAY 0.5
+LIVEKIT_ENDPOINTING_MAX_DELAY 4.0
+OPENROUTER_API_KEY                            # reasoning + vision models
+GROQ_API_KEY / GROQ_API_KEYS                  # fast path (pool round-robins the rate limit)
+GEMINI_API_KEY                                # Gemini Live coding round
+LLM_FAST_MODEL          groq:openai/gpt-oss-120b
+LLM_REASONING_MODEL     openrouter:minimax/minimax-m3
 LLM_FALLBACK_CHAIN      comma-separated ids
-VAD_STOP_SECS           0.2
-SMART_TURN_MODEL_PATH   ./models/smart-turn-v3.1.onnx
+GEMINI_LIVE_MODEL       gemini-flash-live
 INTERVIEW_TIME_BUDGET_S 1200
 COVERAGE_LAMBDA_START   0.5
 COVERAGE_LAMBDA_END     1.5
 CONVICTION_MARGIN       0.25
 CONVICTION_MIN_EVIDENCE 3
-DEMO_MODE               false   # true = paid model IDs, no free tier
+ALLOW_BARGEIN           true
 ```
 
-Voice assignment (Deepgram Flux, `flux-{voice}-en`, plus `expressivity` −2…2):
+Voice assignment (Deepgram Aura, one voice per agent):
 
-| Agent | Accent | Expressivity |
+| Agent | Name | Voice |
 |---|---|---|
-| Technical | Indian | −1 |
-| Product | American | +1 |
-| Hiring Manager | British | 0 |
-| Customer | Indian | +2 |
-| Coding | Singaporean | −1 |
-| Orchestrator | British | −2 |
+| Hiring Manager | Maya | `aura-2-pandora-en` (British female) |
+| Technical | Ethan | `aura-2-orpheus-en` (American male) |
+| Product | Sophia | `aura-2-asteria-en` (American female) |
+| Customer | Nina | `aura-2-amalthea-en` (Filipino female) |
+| Coding | Liam | `aura-2-arcas-en` (American male) |
+| Orchestrator | Julian | `aura-2-draco-en` (British male, baritone) |
 
-Pick the specific voice ids from Deepgram's Flux catalog. Vary pace and pitch,
-not just gender — the candidate must never wonder who is speaking.
+Voices vary accent, pitch and pace, not just gender — the candidate must never
+wonder who is speaking. These assignments apply in both voice modes.
 
 ---
 
 ## 13. Non-negotiables
 
-1. The Orchestrator exposes an OpenAI-compatible endpoint.
+1. The transport calls domain logic through completed transcripts and selected speech; LLM provider requests use the shared router.
 2. Agent isolation is enforced by the prompt builder, not by convention.
 3. Floor control is deterministic code, never a model. Same inputs, same winner,
    always — no randomised tie-breaks.

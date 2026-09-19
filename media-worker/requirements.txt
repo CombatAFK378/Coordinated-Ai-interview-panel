@@ -1,30 +1,17 @@
-# Web
+# Web and the existing panel/scoring providers
 fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
-# multipart/form-data parsing for PDF uploads (JD + résumé, Phase 7)
 python-multipart
-
-# HTTP to Sarvam / Deepgram
 requests
-# JD + résumé PDF text extraction (Phase 7 dossier); pure-Python, no native deps
 pypdf
-# WebSocket client for Deepgram streaming TTS (low time-to-first-audio)
-websocket-client
 
-# VAD
-numpy
-onnxruntime
-silero-vad
-
-# Smart Turn v3.1: Whisper-Tiny encoder end-of-turn model. transformers supplies
-# WhisperFeatureExtractor (the exact log-mel frontend the model expects).
-transformers
-# NOTE: torch + torchaudio (CPU build) are installed separately in the
-# Dockerfile from the PyTorch CPU index, before this file, so silero-vad's
-# torch dependency is already satisfied and pip won't pull the CUDA build.
-
-# Agora
-agora-python-server-sdk
-agora-token-builder
+# Latest stable releases verified against PyPI on 2026-09-19.
+# Agents pins its compatible RTC SDK (1.1.18); do not force RTC 1.1.19 over it.
+livekit-agents==1.8.2
+livekit-api==1.2.1
+livekit-plugins-deepgram==1.8.2
+livekit-plugins-silero==1.8.2
+livekit-plugins-noise-cancellation==0.3.2
+# v1-mini is built into Agents; the deprecated text turn-detector plugin is unnecessary.

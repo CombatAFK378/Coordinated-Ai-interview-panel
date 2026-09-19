@@ -1,7 +1,7 @@
 // Gemini Live coding round (§8): the browser streams the candidate's mic + entire
 // screen to Gemini Live and plays Liam's voice back, all client-side. The server
 // only mints the ephemeral token and receives the final verdict. Isolated from the
-// Agora panel — this runs only during the locked coding phase.
+// LiveKit panel — this runs only during the locked coding phase.
 import {
   GoogleGenAI, Modality, Type, ActivityHandling, StartSensitivity, EndSensitivity,
 } from "@google/genai";
@@ -54,31 +54,36 @@ function systemInstruction(task) {
     "sentences.\n\n" +
     "POLICY: they may use Google or official docs for SYNTAX. The core logic must be " +
     "their own.\n\n" +
-    "CHEATING has a HIGH bar — it means they are ACTIVELY USING an AI assistant to get " +
-    "the answer: an AI chat (ChatGPT, Claude, Copilot, Perplexity, Gemini) is the FOCUSED " +
-    "foreground window with THIS coding problem or its solution typed/visible in it, or " +
-    "they are clearly copying a generated solution into their editor. Be strict — do NOT " +
-    "flag any of these normal things:\n" +
-    "- AI-tool TABS merely open in the browser tab strip, or shortcut tiles / bookmarks " +
-    "for Claude, Perplexity, ChatGPT on a new-tab page.\n" +
-    "- The browser's own built-in buttons like 'Ask Gemini', 'AI Mode', or a Copilot " +
-    "icon — those are part of the browser, not something the candidate is using.\n" +
-    "- Their own code importing or calling AI libraries (openai, langchain, etc.).\n" +
-    "- Other apps or tabs in the background.\n" +
-    "Only flag when an AI assistant is UNMISTAKABLY IN USE for this task (a real chat " +
-    "conversation about the problem is open and focused). If you are not sure it's being " +
-    "used, do NOT flag — assume innocent.\n\n" +
-    "Give them a few minutes to actually work. Two ways the round ends:\n" +
-    "- If you clearly see them USING an AI assistant (as defined above): say EXACTLY " +
-    "this kind of line and nothing else — 'I can see [ChatGPT/Claude] open there — that's " +
-    "not allowed, so that's my read on this round; I'll hand it back to the panel.' — " +
-    "then IMMEDIATELY call finish_coding with verdict 'cheating'.\n" +
-    "- If they finish, solve it, or give up: briefly say how it went, then call " +
-    "finish_coding with verdict 'done'.\n" +
-    "The function call is what ends the round.\n\n" +
-    "CRITICAL: say the closing line ONCE and call finish_coding right away. Do NOT keep " +
-    "repeating yourself, and do NOT drift into unrelated commentary — one observation, " +
-    "then the function call."
+    "CHEATING = an AI assistant chat is VISIBLY OPEN on the screen during this exercise. " +
+    "If you can see a ChatGPT, Claude, Copilot, Gemini, or Perplexity CHAT INTERFACE — its " +
+    "app window, or the active browser tab showing the chat conversation/prompt box — that " +
+    "IS cheating. You do NOT need to read the exact text or confirm this specific problem " +
+    "is in it; an AI chat sitting open on screen while they should be coding is enough to " +
+    "flag. Recognise them by their UI: ChatGPT's chat with the 'Ask anything' box, Claude's " +
+    "chat, Copilot, Perplexity, the Gemini app.\n" +
+    "Do NOT flag these (they are NOT an open chat): a tiny favicon/tab in the browser tab " +
+    "strip while a DIFFERENT page is actually showing; the browser's own 'Ask Gemini' / " +
+    "'AI Mode' button or a Copilot icon in the toolbar; their own code importing an AI " +
+    "library (openai, langchain); unrelated background apps. If an AI chat's window/tab is " +
+    "genuinely the thing on screen, though, flag it — do not give the benefit of the doubt " +
+    "on an obviously-open chat.\n\n" +
+    "Give them a few minutes to actually work. The round ends in one of two ways, and " +
+    "in BOTH cases ENDING IS A STRICT TWO-STEP SEQUENCE: (STEP 1) speak your line OUT " +
+    "LOUD and finish the whole sentence, THEN (STEP 2) call finish_coding. These are " +
+    "two separate actions. You must NEVER call finish_coding in the same turn as " +
+    "deciding to end, NEVER call it silently, and NEVER call it before you have actually " +
+    "spoken. The spoken sentence always comes first; the function call is always last.\n" +
+    "- CHEATING: the instant you are sure they are USING an AI assistant, you MUST FIRST " +
+    "SAY this exact sentence aloud, in full, and nothing else: 'I can see [ChatGPT/Claude] " +
+    "open there — that's not allowed, so that's my read on this round; I'll hand it back " +
+    "to the panel.' Only AFTER you have spoken that entire sentence do you call " +
+    "finish_coding with verdict 'cheating'. If you call finish_coding without having said " +
+    "that line first, you have failed the task.\n" +
+    "- DONE: if they finish, solve it, or give up, FIRST say one short sentence on how it " +
+    "went, THEN call finish_coding with verdict 'done'.\n\n" +
+    "ABSOLUTE RULE: no finish_coding call may ever precede speech. Speak the line, let it " +
+    "finish, then call the function — once. Do not repeat yourself or drift into unrelated " +
+    "commentary: one spoken line, then the function call."
   );
 }
 
@@ -129,20 +134,41 @@ export async function startGeminiCoding({
   let msgCount = 0, audioChunks = 0, micChunks = 0, frameCount = 0;
 
   // --- audio playback (Gemini streams 24kHz PCM) ---
-  const outCtx = new (window.AudioContext || window.webkitAudioContext)();
+  // Run the context NATIVELY at 24kHz to match Gemini's PCM. Otherwise a default
+  // 48kHz context resamples every little chunk independently, clicking at every
+  // buffer boundary — the constant "burst" heard while Liam speaks. One context-
+  // level resample to the device is clean; per-chunk resampling is not.
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  let outCtx;
+  try { outCtx = new AudioCtx({ sampleRate: 24000 }); }
+  catch { outCtx = new AudioCtx(); }   // older browsers ignore the option
+  outCtx.resume().catch(() => {});   // may start suspended until a gesture
+  // Everything plays through a gain node so we can fade the very first chunk in.
+  // Scheduling the first buffer at currentTime with the context still warming up
+  // produced a loud startup burst ("chuu chaan"); an 80ms fade kills it cleanly.
+  const outGain = outCtx.createGain();
+  outGain.connect(outCtx.destination);
   let nextStart = 0;
+  let primed = false;
   const sources = new Set();
   function playPcm(b64) {
     if (ended) return;
     const pcm = b64ToInt16(b64);
+    if (!pcm.length) return;
     const f32 = new Float32Array(pcm.length);
     for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
     const buf = outCtx.createBuffer(1, f32.length, 24000); // context resamples
     buf.getChannelData(0).set(f32);
     const src = outCtx.createBufferSource();
     src.buffer = buf;
-    src.connect(outCtx.destination);
-    const start = Math.max(outCtx.currentTime, nextStart);
+    src.connect(outGain);
+    // Small lead on the first chunk so the context is running before playout.
+    const start = Math.max(outCtx.currentTime, nextStart || outCtx.currentTime + 0.12);
+    if (!primed) {
+      primed = true;
+      outGain.gain.setValueAtTime(0.0001, start);
+      outGain.gain.exponentialRampToValueAtTime(1, start + 0.08);  // fade-in, no burst
+    }
     src.start(start);
     nextStart = start + buf.duration;
     sources.add(src);
@@ -152,6 +178,7 @@ export async function startGeminiCoding({
     for (const s of sources) { try { s.stop(); } catch { /* already stopped */ } }
     sources.clear();
     nextStart = 0;
+    primed = false;   // fade the next chunk in too, so a restart can't burst
   }
 
   let finished = false;   // stop sending input
@@ -328,13 +355,14 @@ export async function startGeminiCoding({
     if (finished) return;
     const w = video.videoWidth, h = video.videoHeight;
     if (!w || !h) return;
-    // Keep frames light so they don't congest the audio stream (which makes
-    // replies feel laggy): smaller + more compressed, every 3s.
-    const scale = Math.min(1, 1024 / w);
+    // Frames must be readable enough for Gemini to RECOGNIZE an AI chat window
+    // (ChatGPT/Claude UI) — 1024px @ 0.4 quality was too blurry to tell, so it
+    // missed cheating. 1440px @ 0.72 is legible without congesting the audio.
+    const scale = Math.min(1, 1440 / w);
     canvas.width = Math.round(w * scale);
     canvas.height = Math.round(h * scale);
     canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-    const b64 = canvas.toDataURL("image/jpeg", 0.4).split(",")[1];
+    const b64 = canvas.toDataURL("image/jpeg", 0.72).split(",")[1];
     try {
       session.sendRealtimeInput({ video: { data: b64, mimeType: "image/jpeg" } });
       frameCount += 1;
@@ -344,10 +372,11 @@ export async function startGeminiCoding({
   log("screen frames streaming every 1.5s");
 
   // Proactive "watch check": while the candidate codes silently there's no speech
-  // to trigger a turn, so Gemini wouldn't look at the screen. Nudge it gently for a
-  // progress comment. NOTE: cheating handling lives ONLY in the system instruction —
-  // re-asking about it every tick made Liam narrate "I see Claude" on a loop instead
-  // of calling finish_coding. So this nudge is purely about progress.
+  // to trigger a turn, so Gemini wouldn't look at the screen on its own. This nudge
+  // makes it INSPECT the screen every tick for BOTH progress AND AI-assistant use.
+  // The key to not looping ("I see Claude" over and over): a positive cheating
+  // sighting must route to the ENDING action (speak once, then finish_coding), not
+  // to commentary — so seeing it resolves the round instead of narrating it.
   watchTimer = setInterval(() => {
     if (finished) return;
     try {
@@ -356,18 +385,22 @@ export async function startGeminiCoding({
           role: "user",
           parts: [{
             text:
-              "[watch check — I may be coding silently] Glance at my screen. If I have " +
-              "code visible, react to what's ACTUALLY there or nudge me if I'm stuck. If " +
-              "there's no editor or code yet, remind me to open one and start. One short " +
-              "sentence — describe only what you truly see, never invent progress, and " +
-              "don't repeat something you've already said.",
+              "[watch check — I may be coding silently] Look carefully at my ENTIRE screen " +
+              "right now. FIRST, check for cheating: if you can see an AI chat interface " +
+              "OPEN on screen — ChatGPT, Claude, Copilot, Gemini, or Perplexity (its chat " +
+              "window or the active tab showing the chat) — that is cheating, so follow your " +
+              "ending rule NOW: say the 'that's not allowed' line ONCE, then call " +
+              "finish_coding with 'cheating'. Do not merely describe it; end the round. You " +
+              "do NOT need to read its text — an AI chat open on screen is enough. OTHERWISE, " +
+              "react in one short sentence to the code that is ACTUALLY visible, or if " +
+              "there's no editor yet remind me to open one. Never invent progress.",
           }],
         }],
         turnComplete: true,
       });
     } catch { /* session may be closing */ }
-  }, 15000);
-  log("watch-check nudges every 15s");
+  }, 12000);
+  log("watch-check nudges every 12s");
 
   // Hard backstop against any loop: if the round never ends on its own, close it out
   // after CODING_MAX_MS so Liam can't narrate forever.

@@ -192,6 +192,23 @@ body {
   background: var(--accent); flex: 0 0 auto;
   animation: breathe 2.4s ease-in-out infinite;
 }
+/* Reasoning-model fallback notice (Gemini free-tier cap → Groq). Amber, so it
+   reads as an advisory, not an error. */
+.model-fallback {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  background: rgba(217, 119, 6, 0.12);
+  border: 1px solid rgba(217, 119, 6, 0.45);
+  color: #b45309;
+  border-radius: var(--r-full);
+  padding: var(--sp-2) var(--sp-4);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+:root:not([data-theme="light"]) .model-fallback,
+:root[data-theme="dark"] .model-fallback { color: #fbbf24; }
 @keyframes breathe { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
 
 /* ===========================================================================

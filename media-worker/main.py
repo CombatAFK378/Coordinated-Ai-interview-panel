@@ -1,17 +1,4 @@
-"""Media worker HTTP surface (Phase 3).
-
-Endpoints:
-  GET  /                 -> serves the candidate web page (React panel room)
-  GET  /health           -> liveness check
-  GET  /panel            -> the five interviewers' roster (for the tiles)
-  POST /session/start    -> mints Agora tokens, joins the bot, starts the pipeline
-  POST /session/interrupt-> manual barge-in
-  POST /session/stop     -> tear down
-  WS   /session/events   -> live speaker signals (who's talking) + captions
-
-One interview per process still. Phase 3 makes it a five-agent panel and streams
-speaker signals to the UI over a WebSocket (our stand-in for Agora RTM).
-"""
+"""Single-session HTTP API, LiveKit voice transport and panel events."""
 import asyncio
 import io
 import logging
@@ -20,22 +7,23 @@ import os
 import shutil
 import time
 import uuid
+import threading
+from contextlib import asynccontextmanager
+from functools import wraps
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from shared.config import get_settings
-from shared.agora_token import build_rtc_token
+from shared.livekit_token import build_room_token
+from shared.panel_routing import PanelRouter
 from shared.models import AskAnswer, Dossier, InterviewReport, Override, SessionStartResponse, WhatIfQuery
 from shared import ask_panel, dossier as dossier_mod, gemini, prompts, scoring, store
 
-from agora_session import AgoraSession
+from livekit_session import LiveKitSession
 from pipeline import InterviewPipeline
 from ask_pipeline import AskPipeline
-import cai_agent
-import cai_llm
 
 _LOG_FMT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=_LOG_FMT)
@@ -92,21 +80,33 @@ def _begin_session_logs(interview_id: str):
     except Exception:
         logger.exception("could not start per-session logs")
 
-BOT_UID = 1
-CANDIDATE_UID = 100
-RECRUITER_UID = 200
-TOKEN_TTL_SECONDS = 3600
+_lifecycle_lock = threading.RLock()
 
-app = FastAPI(title="968ms media worker")
+
+def serialized(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        with _lifecycle_lock:
+            return fn(*args, **kwargs)
+    return guarded
+
+
+@asynccontextmanager
+async def lifespan(app):
+    _broker.bind_loop(asyncio.get_running_loop())
+    yield
+    await asyncio.to_thread(_teardown)
+
+
+app = FastAPI(title="968ms LiveKit media worker", lifespan=lifespan)
 
 # Held for the lifetime of the single active session.
-_session: AgoraSession | None = None
+_session: LiveKitSession | None = None
 _pipeline: InterviewPipeline | None = None
 _ask_pipeline: AskPipeline | None = None   # voice Ask the Panel (Phase 6)
 _report: InterviewReport | None = None   # last locked report (Phase 5)
 _panel_record: ask_panel.PanelRecord | None = None   # for Ask the Panel (Phase 6)
 _dossier: Dossier | None = None          # active interview's dossier (Phase 7)
-_cai_agent_id: str | None = None         # running Agora Conversational AI agent (§CAI)
 
 
 class StartRequest(BaseModel):
@@ -183,6 +183,9 @@ class EventBroker:
 
 _broker = EventBroker()
 
+# Surface reasoning-model fallback (Gemini free-tier cap → Groq) to the UI.
+scoring.set_reasoning_notifier(_broker.publish)
+
 
 def _panel_roster() -> list[dict]:
     return [
@@ -253,81 +256,62 @@ def session_dossier(req: DossierRequest):
     return dossier_mod.build_dossier(req.jd, req.resume)
 
 
+def _voice_settings():
+    settings = get_settings()
+    missing = [name for name, value in {
+        "LIVEKIT_URL": settings.livekit_url,
+        "LIVEKIT_API_KEY": settings.livekit_api_key,
+        "LIVEKIT_API_SECRET": settings.livekit_api_secret,
+        "DEEPGRAM_API_KEY": settings.deepgram_api_key,
+    }.items() if not value]
+    if not (settings.groq_keys or settings.openrouter_api_key or settings.gemini_api_key):
+        missing.append("an LLM provider key (Groq, OpenRouter, or Gemini)")
+    if missing:
+        raise HTTPException(503, f"Missing config: {', '.join(missing)}")
+    return settings
+
+
+def _start_voice(session, pipeline, joined_callback):
+    session.set_on_user_joined(joined_callback)
+    try:
+        pipeline.start()
+        session.start()
+    except Exception:
+        pipeline.stop()
+        session.stop()
+        logger.exception("LiveKit room startup failed")
+        raise HTTPException(502, "Could not connect the voice agent. Check LiveKit configuration and server logs.")
+
+
+def _join_response(settings, room, identity, panel):
+    return SessionStartResponse(
+        server_url=settings.livekit_url, room=room, identity=identity,
+        token=build_room_token(settings, room, identity), panel=panel,
+        noise_cancellation=settings.livekit_noise_cancellation,
+    )
+
+
 @app.post("/session/start", response_model=SessionStartResponse)
+@serialized
 def session_start(req: StartRequest | None = None):
     global _session, _pipeline, _report, _panel_record, _dossier
-    settings = get_settings()
+    settings = _voice_settings()
     req = req or StartRequest()
-
-    missing = [
-        name
-        for name, val in {
-            "AGORA_APP_ID": settings.agora_app_id,
-            "AGORA_APP_CERTIFICATE": settings.agora_app_certificate,
-            "SARVAM_API_KEY": settings.sarvam_api_key,
-            "DEEPGRAM_API_KEY": settings.deepgram_api_key,
-            "OPENROUTER_API_KEY": settings.openrouter_api_key,
-        }.items()
-        if not val
-    ]
-    if missing:
-        raise HTTPException(500, f"Missing config: {', '.join(missing)}")
-
-    # Tear down any previous session (one per process) and clear the last report.
+    # Parse before replacing the active session, so a dossier error is recoverable.
+    dossier = (dossier_mod.build_dossier(req.jd, req.resume)
+               if req.jd.strip() or req.resume.strip() else None)
     _teardown()
-    _report = None
-    _panel_record = None
-
-    # Parse JD + résumé into the dossier once (§9): panel, weights, rubrics,
-    # résumé claims. Empty inputs → generic all-panel interview.
-    _dossier = None
-    if req.jd.strip() or req.resume.strip():
-        _dossier = dossier_mod.build_dossier(req.jd, req.resume)
-        logger.info("dossier: role=%r panel=%s", _dossier.role, _dossier.panel)
-
+    _report = _panel_record = None
+    _dossier = dossier
     interview_id = uuid.uuid4().hex[:12]
-    _begin_session_logs(interview_id)   # fresh per-run log folder
-    channel = f"iv-{interview_id[:8]}"
-    sample_rate = settings.audio_sample_rate
-
-    bot_token = build_rtc_token(
-        settings.agora_app_id, settings.agora_app_certificate, channel, BOT_UID, TOKEN_TTL_SECONDS
-    )
-    candidate_token = build_rtc_token(
-        settings.agora_app_id, settings.agora_app_certificate, channel, CANDIDATE_UID, TOKEN_TTL_SECONDS
-    )
-
-    session = AgoraSession(
-        app_id=settings.agora_app_id,
-        channel=channel,
-        bot_uid=BOT_UID,
-        token=bot_token,
-        sample_rate=sample_rate,
-    )
-    pipeline = InterviewPipeline(
-        session=session,
-        settings=settings,
-        interview_id=interview_id,
-        dossier=_dossier,
-    )
-    # The opener fires when the candidate joins the channel.
-    session.set_on_user_joined(pipeline.on_candidate_joined)
-    # Stream speaker signals / captions to the UI over the events WebSocket.
+    _begin_session_logs(interview_id)
+    room = f"iv-{interview_id}"
+    session = LiveKitSession(settings, room, "candidate", on_event=_broker.publish)
+    pipeline = InterviewPipeline(session, settings, interview_id, dossier=_dossier)
     pipeline.on_event = _broker.publish
-
-    session.start()
-    pipeline.start()
-
+    _start_voice(session, pipeline, pipeline.on_candidate_joined)
     _session, _pipeline = session, pipeline
-    logger.info(f"session started: interview={interview_id} channel={channel}")
-
-    return SessionStartResponse(
-        app_id=settings.agora_app_id,
-        channel=channel,
-        uid=CANDIDATE_UID,
-        token=candidate_token,
-        panel=list(pipeline.panel),
-    )
+    return _join_response(settings, room, "candidate", list(pipeline.panel))
 
 
 class FrameRequest(BaseModel):
@@ -399,10 +383,20 @@ def coding_result(req: CodingResultRequest):
 @app.post("/session/interrupt")
 def session_interrupt():
     """Candidate pressed the Interrupt button — cut the interviewer off now."""
+    pipeline = _ask_pipeline or _pipeline
+    if pipeline is None:
+        raise HTTPException(409, "no active session")
+    interrupted = pipeline.request_interrupt()
+    return {"status": "ok", "interrupted": interrupted}
+
+
+@app.post("/session/skip-intro")
+def session_skip_intro():
+    """Candidate pressed 'Skip intro' — cut the host's disclosure but keep the
+    cold-open going to the first question (does NOT invalidate the turn)."""
     if _pipeline is None:
         raise HTTPException(409, "no active session")
-    interrupted = _pipeline.request_interrupt()
-    return {"status": "ok", "interrupted": interrupted}
+    return {"status": "ok", "interrupted": _pipeline.skip_intro()}
 
 
 @app.post("/session/finish-turn")
@@ -422,12 +416,15 @@ def session_redo():
 
 
 @app.post("/session/conclude", response_model=InterviewReport)
+@serialized
 def session_conclude():
     """Final bell (§6): freeze the interview, then lock → debate → conclusion.
     Blocking and slow (reasoning model, once) — the UI shows a 'scoring…' state."""
     global _report
     if _pipeline is None:
         raise HTTPException(409, "no active session")
+    if not any(t.speaker == "candidate" for t in _pipeline.report_inputs()[0]):
+        raise HTTPException(400, "no candidate answers to score yet")
     _pipeline.freeze()
     _pipeline.assess_coding()   # §8: thorough vision pass on the final screen → coding evidence
     transcript, claims, coverage, panel, contexts = _pipeline.report_inputs()
@@ -457,100 +454,28 @@ def session_conclude():
 
 
 @app.post("/panel/join", response_model=SessionStartResponse)
+@serialized
 def panel_join(req: JoinRequest | None = None):
-    """Voice Ask the Panel (§7): the recruiter joins a channel and talks to the
-    panel about the locked record. Tears down the interview session and starts a
-    recruiter Q&A session on a fresh channel.
-
-    With an `interview_id`, revives that stored interview (dashboard rejoin);
-    otherwise uses the interview just concluded in this process."""
-    global _session, _pipeline, _ask_pipeline, _panel_record, _cai_agent_id
+    """Join the locked panel with all persona voices available by name."""
+    global _session, _ask_pipeline, _panel_record
+    settings = _voice_settings()
     req = req or JoinRequest()
-    if req.interview_id and (_panel_record is None
-                             or _panel_record.interview_id != req.interview_id):
-        loaded = store.load_record(req.interview_id)
-        if loaded is None:
-            raise HTTPException(404, "interview not found")
-        _panel_record = loaded
-    if _panel_record is None:
-        raise HTTPException(409, "no locked report yet — finish & score first")
-    settings = get_settings()
-
-    _teardown()  # the interview is over; reclaim the single AgoraService
-
-    # Unique channel per join. A CAI agent lives in Agora's cloud and outlives our
-    # container, so a leftover agent on a fixed channel name causes a 409 Conflict
-    # on rejoin (we'd have lost its agent_id across a restart). A fresh channel each
-    # time sidesteps that entirely — the browser joins whatever channel we return.
-    channel = f"ask-{_panel_record.interview_id[:8]}-{int(time.time()) % 100000}"
-    recruiter_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
-                                      channel, RECRUITER_UID, TOKEN_TTL_SECONDS)
-
-    # Preferred path: Agora Conversational AI Engine. When REST creds + a public
-    # callback URL are configured, a managed CAI agent runs the whole voice loop
-    # in the channel — Deepgram ASR → OUR grounded brain (the /cai/llm endpoint
-    # below) → Deepgram TTS — instead of our in-process AskPipeline.
-    if cai_agent.enabled(settings):
-        agent_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
-                                      channel, BOT_UID, TOKEN_TTL_SECONDS)
-        rec = _panel_record.report.conclusion.recommendation.replace("_", " ").lower()
-        greeting = (f"Welcome back. The panel concluded: {rec}. Ask me anything about "
-                    "the candidate, or tell me to override the recommendation.")
-        system_prompt = ("You are the interview panel's spokesperson, answering a "
-                         "recruiter's questions grounded strictly in the locked record.")
-        llm_path = f"/cai/llm/{_panel_record.interview_id}/chat/completions"
-        try:
-            _cai_agent_id = cai_agent.start_agent(
-                settings, channel=channel, token=agent_token, agent_uid=BOT_UID,
-                remote_uid=RECRUITER_UID, llm_path=llm_path, system_prompt=system_prompt,
-                greeting=greeting, name=f"panel-{_panel_record.interview_id[:8]}")
-            logger.info("panel voice session via Agora CAI on channel %s (agent=%s)",
-                        channel, _cai_agent_id)
-            return SessionStartResponse(app_id=settings.agora_app_id, channel=channel,
-                                        uid=RECRUITER_UID, token=recruiter_token)
-        except Exception:
-            logger.exception("Agora CAI join failed — falling back to in-process AskPipeline")
-            _cai_agent_id = None
-
-    # Fallback: in-process pipeline (no CAI creds configured, or CAI unreachable).
-    bot_token = build_rtc_token(settings.agora_app_id, settings.agora_app_certificate,
-                                channel, BOT_UID, TOKEN_TTL_SECONDS)
-    session = AgoraSession(app_id=settings.agora_app_id, channel=channel,
-                           bot_uid=BOT_UID, token=bot_token, sample_rate=settings.audio_sample_rate)
-    ask = AskPipeline(session=session, settings=settings, record=_panel_record,
-                      on_event=_broker.publish)
-    session.set_on_user_joined(ask.on_recruiter_joined)
-    session.start()
-    ask.start()
-    _session, _ask_pipeline = session, ask
-    logger.info("panel voice session started on channel %s (in-process)", channel)
-    return SessionStartResponse(app_id=settings.agora_app_id, channel=channel,
-                                uid=RECRUITER_UID, token=recruiter_token)
-
-
-@app.post("/cai/llm/{interview_id}/chat/completions")
-async def cai_llm_chat(interview_id: str, request: Request):
-    """Custom OpenAI-compatible LLM endpoint for the Agora Conversational AI agent.
-
-    CAI does ASR and POSTs the recruiter's turn here as an OpenAI chat-completions
-    request (stream=true). We run the grounded Ask-the-Panel brain over the locked
-    record and stream the answer back as SSE — CAI turns it into speech. This is
-    the seam that keeps OUR intelligence inside Agora's managed voice loop."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    messages = body.get("messages", [])
     record = _panel_record
-    if record is None or record.interview_id != interview_id:
-        record = store.load_record(interview_id)
+    if req.interview_id and (record is None or record.interview_id != req.interview_id):
+        record = store.load_record(req.interview_id)
+        if record is None:
+            raise HTTPException(404, "interview not found")
     if record is None:
-        raise HTTPException(404, "interview not found")
-    return StreamingResponse(
-        cai_llm.stream_panel_answer(record, messages, get_settings(),
-                                    interview_id, on_event=_broker.publish),
-        media_type="text/event-stream",
-    )
+        raise HTTPException(409, "no locked report yet — finish & score first")
+    _teardown()
+    _panel_record = record
+    room = f"ask-{record.interview_id[:8]}-{uuid.uuid4().hex[:8]}"
+    session = LiveKitSession(settings, room, "recruiter", recruiter=True,
+                             on_event=_broker.publish)
+    pipeline = AskPipeline(session, settings, record, on_event=_broker.publish)
+    _start_voice(session, pipeline, pipeline.on_recruiter_joined)
+    _session, _ask_pipeline = session, pipeline
+    return _join_response(settings, room, "recruiter", [s.agent_id for s in record.report.scores])
 
 
 @app.post("/panel/ask", response_model=AskAnswer)
@@ -558,7 +483,12 @@ def panel_ask(req: AskRequest):
     """Ask the Panel (§7): grounded Q&A over the locked record."""
     if _panel_record is None:
         raise HTTPException(409, "no locked report yet — finish & score first")
-    return ask_panel.answer(_panel_record, req.question, req.mode, req.target)
+    target = req.target if req.mode == "addressed" else PanelRouter.detect(req.question)
+    if target and target != "orchestrator":
+        if target not in prompts.AGENTS:
+            raise HTTPException(400, "unknown panel member")
+        return ask_panel.answer(_panel_record, req.question, "addressed", target)
+    return ask_panel.answer(_panel_record, req.question)
 
 
 @app.post("/panel/counterfactual", response_model=WhatIfQuery)
@@ -609,6 +539,7 @@ def list_interviews():
 
 
 @app.post("/interviews/{interview_id}/open", response_model=InterviewReport)
+@serialized
 def open_interview(interview_id: str):
     """Open a stored interview: make it the active record (so Ask-the-Panel,
     override, counterfactual and voice-join all operate on it) and return its
@@ -617,22 +548,26 @@ def open_interview(interview_id: str):
     rec = store.load_record(interview_id)
     if rec is None:
         raise HTTPException(404, "interview not found")
+    _teardown()
     _panel_record = rec
     _report = rec.report
     return rec.report
 
 
 @app.post("/session/stop")
+@serialized
 def session_stop():
     _teardown()
     return {"status": "stopped"}
 
 
 def _teardown():
-    global _session, _pipeline, _ask_pipeline, _cai_agent_id
-    if _cai_agent_id is not None:
-        cai_agent.stop_agent(get_settings(), _cai_agent_id)
-        _cai_agent_id = None
+    global _session, _pipeline, _ask_pipeline
+    if _session is not None:
+        try:
+            _session.interrupt()
+        except Exception:
+            logger.warning("voice already disconnected during teardown")
     if _pipeline is not None:
         _pipeline.stop()
         _pipeline = None

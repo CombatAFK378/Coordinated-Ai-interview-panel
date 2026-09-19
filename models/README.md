@@ -1,17 +1,9 @@
-# models/
+# Voice models
 
-Downloaded ONNX weights live here (they are git-ignored — don't commit them).
+The LiveKit migration uses the audio `v1-mini` turn detector bundled with
+`livekit-agents` and the Silero model bundled with `livekit-plugins-silero`.
+The Docker build validates that both load. No manual model download is needed.
 
-## Smart Turn v3.1 (end-of-turn detection)
-
-```bash
-python models/download_smart_turn.py
-```
-
-Saves `smart-turn-v3.1.onnx`. The media worker reads it via
-`SMART_TURN_MODEL_PATH` (default `models/smart-turn-v3.1.onnx`). If it's absent,
-the worker runs without end-of-turn detection — every VAD pause is treated as a
-complete turn, which is the Phase-1 behaviour.
-
-Under Docker Compose this directory is mounted into the container, so downloading
-it once on the host is enough.
+Any ignored Smart Turn `.onnx` files left from the Agora branch are unused on
+this branch. They may be retained locally for rollback; they are not copied into
+the LiveKit image or mounted into its container.

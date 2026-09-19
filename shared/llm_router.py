@@ -50,9 +50,13 @@ def _next_key(keys: list[str]) -> str:
     return key
 
 # provider name -> (chat-completions URL, Settings attribute holding the key)
+# Google exposes an OpenAI-compatible endpoint, so Gemini plugs in like the others
+# (same request/response shape, Bearer auth) — used for the reasoning model, which
+# the free OpenRouter tiers can no longer serve reliably.
 PROVIDERS = {
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "openrouter_api_key"),
     "groq": ("https://api.groq.com/openai/v1/chat/completions", "groq_api_key"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini_api_key"),
 }
 DEFAULT_PROVIDER = "openrouter"
 
@@ -249,7 +253,12 @@ def _call(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if reasoning_effort and "gpt-oss" in model_id:
+    # reasoning_effort caps how much a model "thinks" before answering. gpt-oss
+    # reasons by default; Gemini 2.5 *thinks* by default and those tokens eat the
+    # output budget, TRUNCATING the JSON — so we pass "none" to turn thinking off
+    # and get the answer directly. Other providers use a different knob, so it's
+    # dropped for them rather than erroring.
+    if reasoning_effort and ("gpt-oss" in model_id or model_id.startswith("gemini-2.5")):
         body["reasoning_effort"] = reasoning_effort
 
     resp = requests.post(

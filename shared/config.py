@@ -4,40 +4,21 @@ Values come from environment variables (loaded from a .env file in dev).
 Keeping this in one place means we never scatter os.getenv() calls around.
 """
 from functools import lru_cache
+from typing import Literal
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # Agora
-    agora_app_id: str = ""
-    agora_app_certificate: str = ""
-    # Agora Conversational AI Engine (CAI). Different creds from App ID/Cert:
-    # Console → RESTful API → Add a secret. Used as Basic auth for the CAI REST
-    # API that spins up a cloud voice agent (ASR → our custom LLM → TTS) in the
-    # channel. When customer_id/secret are unset, the app falls back to the
-    # in-process AgoraSession pipeline.
-    agora_customer_id: str = ""
-    agora_customer_secret: str = ""
-    # CAI region base host. Global is fine for most; override if your project is
-    # region-locked (e.g. the -ap / -eu / -na variants Agora documents).
-    agora_cai_base_url: str = "https://api.agora.io"
-    # Publicly reachable base URL of THIS media worker (the tunnel URL), so the
-    # CAI cloud agent can call our custom OpenAI-compatible LLM endpoint over
-    # HTTPS. Must be set (per demo run) for CAI to work — localhost is unreachable
-    # from Agora's cloud. e.g. https://abc123.ngrok-free.app
-    public_base_url: str = ""
-    # CAI ASR/TTS vendor selection (Sarvam is NOT a CAI ASR vendor, so the CAI
-    # path uses Deepgram for ASR; TTS reuses our Deepgram key too).
-    cai_asr_vendor: str = "deepgram"
-    cai_asr_model: str = "nova-3"
-    cai_asr_language: str = "en-US"
-    cai_tts_vendor: str = "deepgram"
-    # Orchestrator-only in CAI mode, so match Julian's in-process voice
-    # (aura-2-draco-en, British male baritone) — a female voice narrating felt off.
-    cai_tts_model: str = "aura-2-draco-en"
-
-    # Speech providers
-    sarvam_api_key: str = ""
+    # LiveKit Cloud or a self-hosted LiveKit server. Secrets never reach the browser.
+    livekit_url: str = ""
+    livekit_api_key: str = ""
+    livekit_api_secret: str = ""
+    livekit_noise_cancellation: Literal["bvc", "nc", "off"] = "bvc"
+    livekit_stt_model: str = "nova-3"
+    livekit_stt_language: str = "en-US"
+    livekit_endpointing_min_delay: float = Field(default=0.5, ge=0)
+    livekit_endpointing_max_delay: float = Field(default=4.0, gt=0)
     deepgram_api_key: str = ""
 
     # LLM. Every model call goes through the shared router in
@@ -52,14 +33,22 @@ class Settings(BaseSettings):
     # single groq_api_key if unset.
     groq_api_keys: str = ""
     llm_fast_model: str = "groq:openai/gpt-oss-120b"      # candidate is waiting
-    llm_reasoning_model: str = "openrouter:minimax/minimax-m3:free"
+    # Reasoning model (scoring, debate, conclusion, dossier). Gemini 2.5 Flash via
+    # Google's OpenAI-compatible endpoint: reliable, fast (~8s), strong instruction
+    # following (correct panel composition), generous free tier. The OpenRouter
+    # free reasoning tiers (MiniMax delisted, Nemotron overloaded, Laguna 429) are
+    # no longer dependable, so they're gone.
+    llm_reasoning_model: str = "gemini:gemini-2.5-flash"
+    # Two fallbacks if the primary is momentarily down: gpt-oss (Groq pool, very
+    # reliable) then a second Gemini tier. Comma-separated.
+    llm_reasoning_fallbacks: str = "groq:openai/gpt-oss-120b,gemini:gemini-2.0-flash"
     llm_fallback_chain: str = ""                          # comma-separated ids
     # Coding round (§8) vision models — gpt-oss is text-only, so these must be
     # image-capable. Two tiers: a FAST one for live screen reads mid-interview, and
     # a bigger one for the scoring pass at conclude (latency-insensitive). Both
     # verified free + vision-capable on OpenRouter (Gemma 4, no reasoning overhead).
     # No fallback chain (text models can't see) — coding degrades to verbal on fail.
-    llm_vision_fast: str = "openrouter:google/gemma-4-26b-a4b-it:free"
+    llm_vision_fast: str = "openrouter:google/gemma-4-31b-it:free"
     llm_vision_model: str = "openrouter:google/gemma-4-31b-it:free"
     # Gemini Live (§8): realtime screen-watch + voice for the coding round, run in
     # the browser via a server-minted ephemeral token. If the key is unset the
@@ -68,17 +57,7 @@ class Settings(BaseSettings):
     gemini_live_model: str = "gemini-3.1-flash-live-preview"
     # Free vision tiers rate-limit (429) often, so a vision read falls through this
     # chain before giving up (all verified free + image-capable on OpenRouter).
-    llm_vision_fallbacks: str = ("openrouter:google/gemma-4-31b-it:free,"
-                                 "openrouter:minimax/minimax-m3:free")
-
-    # Smart Turn v3.1 end-of-turn detection
-    smart_turn_model_path: str = "models/smart-turn-v3.1.onnx"
-    smart_turn_threshold: float = 0.5
-
-    # TTS: streaming (Deepgram WebSocket) for low first-audio latency (~1.3s). The
-    # socket is occasionally slow to connect; we fail fast to REST on those, so
-    # streaming stays the default and a bad moment just degrades, never stalls.
-    tts_use_streaming: bool = True
+    llm_vision_fallbacks: str = "openrouter:google/gemma-4-31b-it:free"
 
     # Barge-in (interrupt the agent by talking over it). Needs the candidate on
     # headphones — otherwise the agent's own voice echoes into the mic and
@@ -98,8 +77,6 @@ class Settings(BaseSettings):
     conviction_min_evidence: int = 3
 
     # Phase 1 tunables
-    vad_stop_secs: float = 0.2
-    audio_sample_rate: int = 16000
     media_worker_port: int = 8080
 
     # Phase 8: where locked interviews are persisted (one JSON per interview), so
@@ -108,7 +85,11 @@ class Settings(BaseSettings):
     data_dir: str = "/app/data"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # /app/.env is the mounted file inside the container (docker-compose);
+        # ".env" is the local file for non-Docker runs. Reading the file at
+        # startup (instead of baked env vars) means editing .env + a restart
+        # applies changes — no container recreate needed.
+        env_file=("/app/.env", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -117,6 +98,20 @@ class Settings(BaseSettings):
     def fallback_models(self) -> list[str]:
         """Parsed fallback chain: primary tried first, then these in order."""
         return [m.strip() for m in self.llm_fallback_chain.split(",") if m.strip()]
+
+    @model_validator(mode="after")
+    def validate_voice(self):
+        if self.livekit_url and not self.livekit_url.startswith(("ws://", "wss://")):
+            raise ValueError("LIVEKIT_URL must start with ws:// or wss://")
+        if self.livekit_endpointing_max_delay < self.livekit_endpointing_min_delay:
+            raise ValueError("LiveKit maximum endpointing delay must be >= minimum delay")
+        return self
+
+    @property
+    def reasoning_fallbacks(self) -> list[str]:
+        """Reasoning models tried (in order) if the primary reasoning model fails,
+        before the final gpt-oss safety net."""
+        return [m.strip() for m in self.llm_reasoning_fallbacks.split(",") if m.strip()]
 
     @property
     def vision_fallbacks(self) -> list[str]:

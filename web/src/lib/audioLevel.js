@@ -1,6 +1,6 @@
 // Real audio amplitude, tapped without touching playback.
 //
-// Agora owns the playback path. We build a second MediaStream from the same
+// LiveKit owns the playback path. We build a second MediaStream from the same
 // track purely to analyse it, so nothing here can break what the candidate
 // hears. Levels are written straight to a CSS custom property rather than to
 // React state: this runs at animation frame rate and must never re-render.
@@ -74,14 +74,14 @@ export function startLevelMeters({ el, remoteTrack, micTrack }) {
 /**
  * Pan the panel's single audio track to match the speaker's seat.
  *
- * Agora sends one track for all five interviewers, so without this every voice
+ * LiveKit sends one track for all five interviewers, so without this every voice
  * arrives from dead centre. Panning to the speaking seat is what makes five
  * voices read as five people around a table rather than one speaker changing
  * costume.
  *
  * IMPORTANT: this takes over playback. The caller must NOT also call
- * agoraTrack.play(), or the candidate hears everything twice. If this returns
- * null for any reason, the caller must fall back to Agora's own playback.
+ * track.attach(), or the candidate hears everything twice. If this returns
+ * null for any reason, the caller must fall back to LiveKit's own playback.
  */
 export function createPanner(track) {
   if (!track) return null;
@@ -112,9 +112,14 @@ export function createPanner(track) {
 
     return {
       // Construction succeeding is NOT the same as audio flowing. The caller
-      // must poll this and fall back to Agora playback if it stays false, or a
+      // must poll this and fall back to LiveKit playback if it stays false, or a
       // suspended context means a silent interview with no visible symptom.
       running: () => ctx.state === "running",
+      resume: () => ctx.resume(),
+      // Suspend the graph so it isn't driving the audio device while another
+      // capture (screen share + Gemini's mic/AudioContext) reconfigures it —
+      // otherwise the live panner screeches ("chuu chaan") at that moment.
+      suspend: () => { try { return ctx.suspend(); } catch { return Promise.resolve(); } },
       // seat runs -1 (far left) to 1 (far right); kept well inside the extremes
       // so nobody ends up entirely in one ear.
       setSeat(seat) {

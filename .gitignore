@@ -41,3 +41,6 @@ agorareport.dat
 
 # Phase 8: persisted interviews (may contain candidate PII)
 data/
+
+# stray sqlite ":memory:" artifact
+:memory:*

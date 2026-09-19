@@ -77,7 +77,7 @@ def build_dossier(jd: str, resume: str) -> Dossier:
     try:
         data = scoring._parse_json(scoring.reason(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=1200))
+            max_tokens=2000))
     except Exception:
         logger.exception("dossier parse failed; using generic dossier")
         return Dossier()

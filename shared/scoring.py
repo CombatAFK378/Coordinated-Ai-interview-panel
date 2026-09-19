@@ -6,7 +6,7 @@ ledger; deterministic conviction; a SHA-256 hash of the canonical record;
 sequential debate where a STRONG agent physically cannot move its score; and one
 Orchestrator conclusion that reports the split (never an average).
 
-Nothing here is a web/Agora concern, so it lifts cleanly into the standalone
+Nothing here is a web/voice transport concern, so it lifts cleanly into the standalone
 Orchestrator service later.
 """
 import hashlib
@@ -28,20 +28,91 @@ logger = logging.getLogger(__name__)
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
 _VALID_RECS = {REC_PROCEED, REC_PROCEED_FLAGGED, REC_INSUFFICIENT, REC_DECLINE}
 
+# Which reasoning model is actually serving right now — so the UI can show when
+# the primary (Gemini) hits its free-tier cap and we fall back to Groq. A single
+# notifier (registered by the worker) is called ONLY on a transition, not per call.
+_reasoning_notifier = None
+_reasoning_serving: dict = {"model": None}
+
+
+def set_reasoning_notifier(fn):
+    """Register a callback(event_dict) invoked when the serving reasoning model
+    changes (e.g. Gemini → Groq fallback, or recovery)."""
+    global _reasoning_notifier
+    _reasoning_notifier = fn
+
+
+def _friendly_model(model_id: str) -> str:
+    """'gemini:gemini-2.5-flash' -> 'Gemini 2.5 Flash'; 'groq:openai/gpt-oss-120b'
+    -> 'Groq (gpt-oss-120b)'. Best-effort, for the UI badge."""
+    bare = model_id.split(":", 1)[-1]
+    if "gemini" in model_id:
+        return "Gemini " + bare.replace("gemini-", "").replace("-", " ").title()
+    if model_id.startswith("groq:"):
+        return f"Groq ({bare.split('/')[-1]})"
+    return bare.split("/")[-1]
+
+
+def _note_serving(model_id: str, primary: str):
+    """Emit a UI event only when the serving reasoning model changes."""
+    if _reasoning_serving["model"] == model_id:
+        return
+    _reasoning_serving["model"] = model_id
+    if _reasoning_notifier is None:
+        return
+    try:
+        _reasoning_notifier({
+            "type": "model_status",
+            "fell_back": model_id != primary,
+            "model": model_id,
+            "primary": primary,
+            "model_name": _friendly_model(model_id),
+            "primary_name": _friendly_model(primary),
+        })
+    except Exception:
+        logger.exception("reasoning notifier failed")
+
 
 def reason(messages: list[dict], max_tokens: int = 600) -> str:
-    """Call the reasoning model, retrying through transient overloads; fall back
-    to gpt-oss (reliable via the Groq key pool) only if it stays down."""
+    """Call the reasoning model, walking the configured fallbacks and finally
+    gpt-oss (reliable clean JSON via the Groq pool, since its chain-of-thought
+    goes to a separate channel).
+
+    Every caller parses JSON out of the result, so this is JSON-AWARE: a 200-OK
+    response that contains no JSON object — a "thinking" model that spent its
+    whole token budget on chain-of-thought and never answered — is treated as a
+    failure and we fall through to the next model. retries=0 so we don't linger on
+    an overloaded model; the chain is the resilience."""
     settings = get_settings()
-    try:
-        return llm_router.chat(messages, model=settings.llm_reasoning_model,
-                               temperature=0.4, max_tokens=max_tokens, timeout=90,
-                               retries=3, use_fallback_chain=False)
-    except Exception as e:
-        logger.warning("reasoning model failed (%s); falling back to gpt-oss", e)
-        return llm_router.chat(messages, model="groq:openai/gpt-oss-120b",
-                               temperature=0.4, max_tokens=max_tokens,
-                               reasoning_effort="high", use_fallback_chain=False)
+    chain = [settings.llm_reasoning_model] + settings.reasoning_fallbacks
+    last_err: Exception | None = None
+    last_raw = ""
+    for model_id in chain:
+        kwargs = dict(temperature=0.4, max_tokens=max_tokens, timeout=60,
+                      use_fallback_chain=False)
+        if model_id.startswith("groq:"):
+            # gpt-oss: low reasoning effort so it emits JSON instead of thinking the
+            # budget away, with retries to ride out empty-content blips.
+            kwargs.update(retries=2, reasoning_effort="low")
+        elif model_id.startswith("gemini:"):
+            # Gemini 2.5 thinks by default and truncates the JSON — turn it off.
+            kwargs.update(retries=1, reasoning_effort="none")
+        else:
+            kwargs.update(retries=1)   # one retry for a transient blip, then move on
+        try:
+            raw = llm_router.chat(messages, model=model_id, **kwargs)
+            last_raw = raw
+            # JSON-aware: a 200-OK with no JSON (a "thinking" model that never
+            # answered) counts as a failure → fall through to the next model.
+            if _last_json_object(raw) is None:
+                raise ValueError("response had no JSON (model thought without answering)")
+            _note_serving(model_id, chain[0])   # surface which model actually served
+            return raw
+        except Exception as e:
+            last_err = e
+            logger.warning("reasoning model %s failed (%s); trying next", model_id, e)
+    logger.error("all reasoning models failed; last error: %s", last_err)
+    return last_raw   # let the caller's _parse_json raise a clean, catchable error
 
 
 def _clamp(v, lo=0.0, hi=1.0) -> float:
@@ -52,10 +123,35 @@ def _clamp(v, lo=0.0, hi=1.0) -> float:
 
 
 def _parse_json(raw: str) -> dict:
-    m = _JSON.search(raw)
-    if not m:
-        raise ValueError(f"no JSON object in: {raw[:120]!r}")
-    return json.loads(m.group(0))
+    """Extract a JSON object from a model response.
+
+    Reasoning models (Nemotron etc.) emit chain-of-thought *then* the JSON, so a
+    greedy first-brace-to-last-brace grab spans the thinking and fails. Scan from
+    the right for the LAST balanced {...} object that actually parses."""
+    obj = _last_json_object(raw)
+    if obj is None:
+        raise ValueError(f"no JSON object in: {raw[:160]!r}")
+    return obj
+
+
+def _last_json_object(s: str):
+    """Return the last balanced, parseable JSON object in `s`, or None."""
+    end = s.rfind("}")
+    while end != -1:
+        depth = 0
+        for i in range(end, -1, -1):
+            c = s[i]
+            if c == "}":
+                depth += 1
+            elif c == "{":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(s[i:end + 1])
+                    except Exception:
+                        break   # this candidate is malformed; try an earlier '}'
+        end = s.rfind("}", 0, end)
+    return None
 
 
 # ---- lock (scoring) ----------------------------------------------------
@@ -72,14 +168,25 @@ def compute_conviction(overall: float, evidence_count: int) -> str:
 def score_agent(agent_id: str, transcript: list, claims: list, interview_id: str,
                 context: str = "") -> AgentScore:
     my_comps = set(prompts._agent_competencies(agent_id))
-    raw = reason(prompts.build_scoring_prompt(agent_id, transcript, claims, context), max_tokens=700)
-    data = _parse_json(raw)
+    # evidence_count for conviction is the objective count of ledger claims in this
+    # agent's area, computed regardless of whether the model call succeeds.
+    ev_count = sum(1 for c in claims if c.competency in my_comps)
+    try:
+        raw = reason(prompts.build_scoring_prompt(agent_id, transcript, claims, context), max_tokens=1100)
+        data = _parse_json(raw)
+    except Exception as e:
+        # A single interviewer's scoring failing must NOT crash the whole conclude.
+        # Neutral placeholder so the report still locks; the recruiter sees it wasn't scored.
+        logger.warning("scoring %s failed (%s); using a neutral placeholder score", agent_id, e)
+        return AgentScore(
+            interview_id=interview_id, agent_id=agent_id,
+            competency_scores={}, overall=0.5,
+            conviction=compute_conviction(0.5, ev_count), evidence=[],
+            rationale="Automatic scoring was unavailable for this interviewer (model error).",
+        )
     comp = {str(k): _clamp(v) for k, v in (data.get("competency_scores") or {}).items()}
     overall = _clamp(data.get("overall", (sum(comp.values()) / len(comp)) if comp else 0.5))
     evidence = [str(e) for e in (data.get("evidence") or [])][:20]
-    # evidence_count for conviction is the objective count of ledger claims in
-    # this agent's area, not just what the model chose to cite.
-    ev_count = sum(1 for c in claims if c.competency in my_comps)
     return AgentScore(
         interview_id=interview_id, agent_id=agent_id,
         competency_scores=comp, overall=overall,
@@ -153,7 +260,7 @@ def run_debate(scores: list[AgentScore], interview_id: str) -> list[DebateStatem
     for agent_id in order:
         s = score_map[agent_id]
         try:
-            data = _parse_json(reason(prompts.build_debate_prompt(agent_id, scores_summary, ctx, s.conviction), max_tokens=400))
+            data = _parse_json(reason(prompts.build_debate_prompt(agent_id, scores_summary, ctx, s.conviction), max_tokens=1000))
         except Exception as e:
             logger.warning("debate %s failed: %s", agent_id, e)
             data = {"action": "HOLD", "statement": "(no comment)", "new_overall": s.overall}
@@ -195,7 +302,7 @@ def conclude(interview_id: str, scores: list[AgentScore],
                    + f"\nEvidence volume: {len(claims)} claims ({solid} solid); "
                    f"mean coverage {int(mean_cov * 100)}%. Thin evidence → INSUFFICIENT_SIGNAL, not DECLINE.")
     try:
-        data = _parse_json(reason(prompts.build_conclusion_prompt(scores_summary, debate_summary, cov_summary), max_tokens=700))
+        data = _parse_json(reason(prompts.build_conclusion_prompt(scores_summary, debate_summary, cov_summary), max_tokens=1100))
     except Exception as e:
         logger.warning("conclusion failed: %s", e)
         data = {"recommendation": REC_INSUFFICIENT, "headline": "Conclusion unavailable",

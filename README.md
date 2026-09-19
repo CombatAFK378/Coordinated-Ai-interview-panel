@@ -1,161 +1,102 @@
 # 968ms — Coordinated AI Interview Panel
 
-An adaptive, voice-based AI interview panel. A candidate joins a live call and is
-interviewed by a coordinated panel of AI interviewers; afterwards a recruiter can
-talk to the panel to interrogate the decision. Built on **Agora** for real-time
-audio, including the **Agora Conversational AI Engine** for the recruiter Q&A.
+A live AI interview panel with five specialized interviewers and a host. This
+branch uses **LiveKit** for both the candidate interview and recruiter Q&A.
+Panel bidding, evidence, independent scores, debate, dossiers, saved reports and
+the optional Gemini Live coding round retain their existing domain logic.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
+## Ask the Panel
 
----
+Open a scored interview, join voice, and say **“Hey Liam, why did you give that
+coding score?”** or **“Hey Maya, what concerned you?”**. That interviewer answers
+from the locked record in their own Deepgram Aura voice. Unnamed follow-ups stay
+with them; address Julian or the whole panel to return to the host. An interviewer
+who did not assess the candidate says so. Typed questions support names too.
 
-## What it does
+There is one LiveKit RTC participant and one listening pipeline for the panel,
+with six persona-specific speech plugins and separate grounded LLM contexts.
+The application controls who holds the floor; this design supports each voice
+without six simultaneous listeners or agents answering over one another.
 
-**The interview.** The candidate joins a web page (mic + camera) and is greeted by
-a host who discloses that the panel is AI. Up to five specialized interviewers —
-hiring manager, technical, product, customer advocate, and a coding interviewer —
-take turns based on **deterministic floor control**: each turn, all interviewers
-bid in parallel and the one with the highest priority
-(`interest × (1 + λ·coverage_gap) × recency`) gets the floor, so questioning chases
-whatever the panel still doesn't know. The candidate can talk over an interviewer
-to interrupt; the record notes exactly how much was actually heard.
-
-**The coding round.** The coding interviewer runs a short live exercise: the
-candidate shares their screen and a vision model (Gemini Live) watches in real
-time, giving feedback and flagging outside AI help.
-
-**Scoring.** Each interviewer scores privately and independently; the scores lock,
-the panel debates, and a final recommendation is produced with a full evidence
-ledger — every claim tied to the turn it came from.
-
-**Ask the Panel.** After scoring, a recruiter joins by voice and simply talks to
-the panel about the candidate — grounded strictly in the locked record. This runs
-through the **Agora Conversational AI Engine**: a managed cloud agent handles the
-whole voice loop (Deepgram ASR → our grounded LLM → Deepgram TTS) with semantic
-turn-detection. The recruiter can also override the recommendation by voice.
-
-## How the audio pipeline works
+## Voice stack
 
 ```
-candidate mic → Agora → media worker → Silero VAD → Smart Turn v3.1 → Sarvam STT
-                                                                          ↓
-                                                                  transcript turn
-                                                                          ↓
-        speaker ← Agora ← media worker ← Deepgram Aura TTS ← LLM (panel brain)
+microphone → LiveKit room → BVC → Silero + Deepgram streaming STT
+                              → LiveKit audio turn detector v1-mini
+                              → existing interview / grounded Q&A brain
+                              → selected persona's Deepgram streaming TTS
+                              → LiveKit room → browser speaker
 ```
 
-Every model call goes through a shared LLM router with a cross-provider fallback
-chain (Groq `gpt-oss-120b` for the sub-second fast path, OpenRouter for reasoning).
+- `v1-mini` is the **audio** turn detector bundled in LiveKit Agents, explicitly
+  selected in every environment. The old text turn-detector plugin is not used.
+- BVC removes background voices as well as noise and **requires LiveKit Cloud**.
+  Use `LIVEKIT_NOISE_CANCELLATION=off` with a self-hosted LiveKit server. Browser
+  echo cancellation remains enabled; browser noise suppression is off when BVC
+  or NC is enabled to avoid applying two noise filters.
+- LiveKit handles endpointing, speech interruption and playout. **Done** commits
+  the current turn. **Interrupt** also works when automatic barge-in is disabled.
+- The FastAPI worker embeds the voice session; it does not require an additional
+  dispatch worker, a public LLM callback URL, or a tunnel for local development.
 
-## Tech stack
+## Run with Docker
 
-- **Real-time audio:** Agora RTC (candidate/interview) + Agora Conversational AI
-  Engine (recruiter Ask-the-Panel).
-- **Speech:** Silero VAD, Smart Turn v3.1 (end-of-turn), Sarvam STT, Deepgram Aura
-  TTS.
-- **Vision (coding round):** Gemini Live.
-- **LLMs:** Groq + OpenRouter, via a shared router.
-- **Backend:** Python FastAPI media worker (Linux container).
-- **Frontend:** React + Vite, served by the worker.
+1. For a fresh setup, copy `.env.example` to `.env`. For an existing setup, keep
+   your `.env` and add the new LiveKit fields; do not overwrite provider keys.
+2. Set `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` from your
+   [LiveKit Cloud project](https://cloud.livekit.io/). Keep `DEEPGRAM_API_KEY` for
+   both streaming STT and TTS. Keep keys for the LLM providers configured in your
+   model settings (Groq, Gemini and/or OpenRouter).
+3. Run `docker compose up --build`. Open [localhost:8080](http://localhost:8080),
+   allow microphone and camera, and join an interview. Both local voice models
+   are bundled and checked during the image build; no model download is needed.
+4. Finish and score, or open a saved interview, then join **Ask the Panel**.
 
-## Layout
+The `.env` file and Python source remain mounted. Restart after changing keys;
+rebuild after changing dependencies or frontend code. Saved interviews remain
+in `./data`. For frontend development, run `cd web && npm ci && npm run dev`.
+Use one Uvicorn worker: active session state is currently in memory and the app
+supports one interview or recruiter voice session at a time.
 
-```
-media-worker/   FastAPI app: Agora join, VAD, Smart Turn, STT, TTS, panel loop,
-                coding round, and the Agora Conversational AI integration (Docker)
-web/            React + Vite candidate & recruiter UI (built to web/dist, served at "/")
-shared/         Config, Agora tokens, models, prompts (agents), orchestrator
-                (floor control + parallel bids), LLM router, scoring, Ask-the-Panel
-models/         Downloaded ONNX weights (Smart Turn)
-```
+## Branch and rollback
 
-The media worker runs in a **Linux container** because Agora's server-side audio
-SDK ships Linux/macOS binaries only. Your browser runs natively.
+The migration is on `codex/livekit-migration`. Agora code and dependencies are
+removed from this branch's runtime. The existing `main` branch retains Agora;
+there is no need to install both SDK stacks in the same image. Existing local
+Agora credentials and downloaded model files can be retained for rollback.
 
----
+Compose uses the separate project `interviewer-livekit` and image
+`interviewer-livekit:local`. Set `APP_PORT=8081` to run alongside an existing
+Agora container on 8080. Do not edit a shared checkout while running both code
+mounted containers; use separate checkouts for simultaneous operation. The data
+folder is shared with the current checkout, so back it up before demos that write
+reports. Stop this project with `docker compose down`; no data volumes are erased.
 
-## Running the app
+## Versions and checks
 
-Follow these steps in order. Steps 3 and 4 must both be running for the app to
-work — the Cloudflare tunnel (step 3) and the Docker worker (step 4).
+Stable releases verified on 2026-09-19:
 
-### 1. Add your API keys
-
-Copy the template and fill it in:
-
-```bash
-cp .env.example .env
-```
-
-You need these keys in `.env`:
-
-| Key | Where to get it |
+| Package | Version |
 |---|---|
-| `AGORA_APP_ID` + `AGORA_APP_CERTIFICATE` | Agora Console → your project (enable the App Certificate under Security) |
-| `AGORA_CUSTOMER_ID` + `AGORA_CUSTOMER_SECRET` | Agora Console → **RESTful API** → Add a Secret (used by the Ask-the-Panel Conversational AI agent) |
-| `SARVAM_API_KEY` | Sarvam dashboard (speech-to-text) |
-| `DEEPGRAM_API_KEY` | Deepgram console (text-to-speech) |
-| `OPENROUTER_API_KEY` | OpenRouter dashboard |
-| `GROQ_API_KEY` | Groq console (the sub-second fast path) |
-| `GEMINI_API_KEY` | Google AI Studio (the live screen-watch coding round) |
-| `PUBLIC_BASE_URL` | Your Cloudflare tunnel URL — set in step 3 |
+| LiveKit Agents / Deepgram / Silero Python plugins | 1.8.2 |
+| Noise cancellation | 0.3.2 |
+| LiveKit API | 1.2.1 |
+| Browser `livekit-client` | 2.22.3 |
 
-### 2. Get the Smart Turn weights
+Agents pins its compatible RTC SDK to `livekit==1.1.18`; the independently newer
+RTC release must not override that constraint. The browser dependency is locked
+in `web/package-lock.json`. Update the Python plugin group together and rebuild.
 
 ```bash
-python models/download_smart_turn.py
+python -m pip install -r media-worker/requirements.txt -r requirements-dev.txt
+python -m pytest
+cd web && npm ci && npm run build
 ```
 
-### 3. Start the Cloudflare tunnel
+See [ARCHITECTURE.md](ARCHITECTURE.md) and
+[the migration checklist](docs/livekit-migration.md) for the design and live
+acceptance checks. LiveKit Cloud/BVC, Deepgram and LLM calls require working keys;
+a successful build alone does not verify microphone quality or live routing.
 
-The **Ask the Panel** agent runs in Agora's cloud (the Conversational AI Engine),
-so it must reach your worker over a public HTTPS URL. Install
-[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-(`brew install cloudflared` on macOS), then run:
-
-```bash
-cloudflared tunnel --protocol http2 --url http://localhost:8080
-```
-
-It prints a URL like `https://<random-words>.trycloudflare.com`. Copy it into
-`.env` as `PUBLIC_BASE_URL` (no trailing slash — this is **your** tunnel):
-
-```
-PUBLIC_BASE_URL=https://<random-words>.trycloudflare.com
-```
-
-**Leave this terminal running** while you use the app. Restarting the tunnel gives
-a new URL — update `PUBLIC_BASE_URL` and restart the worker (step 4).
-
-### 4. Build and run the media worker
-
-In a **separate** terminal:
-
-```bash
-docker compose up --build
-```
-
-The first build downloads torch + the Agora SDK, so it takes a few minutes. When
-it's ready you'll see `Uvicorn running on http://0.0.0.0:8080`.
-
-### 5. Open the app
-
-Go to **http://localhost:8080**.
-
-- **Run an interview:** click **Join Interview** and allow the mic + camera. The
-  panel greets you and asks questions — answer, then pause. Talk over an
-  interviewer to interrupt. When done, click **Finish & score**.
-- **Ask the Panel:** open a scored interview and click **Ask the Panel**. The
-  Conversational AI agent joins and answers your spoken questions about the
-  candidate. You can also say *"override and accept the candidate"* (or decline).
-
-### Where the CAI integration lives
-
-- [media-worker/cai_agent.py](media-worker/cai_agent.py) — creates/starts the
-  Agora Conversational AI cloud agent (the `join` REST call) and configures ASR,
-  the custom LLM, and TTS.
-- [media-worker/cai_llm.py](media-worker/cai_llm.py) — the custom
-  OpenAI-compatible LLM the CAI agent calls: runs the grounded panel brain and
-  streams the answer back.
-- [media-worker/main.py](media-worker/main.py) — `/panel/join` starts the agent;
-  `/cai/llm/{interview_id}/chat/completions` is the endpoint the agent calls.
+References: [LiveKit turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/),
+[noise cancellation plugin](https://pypi.org/project/livekit-plugins-noise-cancellation/).

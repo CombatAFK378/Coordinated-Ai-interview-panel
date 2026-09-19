@@ -12,3 +12,7 @@ models/*.jit
 agora_rtc_log/
 *.log
 .DS_Store
+
+data/
+.pytest_cache/
+tests/

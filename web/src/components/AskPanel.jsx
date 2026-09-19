@@ -2,7 +2,7 @@ import { agentHue } from "../lib/agents";
 import { prettyEnum, shortTime } from "../lib/format";
 
 export default function AskPanel({
-  report, nameOf, talking, speaking, onJoinVoice, onToggleMic, micMuted,
+  report, nameOf, talking, speaking, busy, onJoinVoice, onToggleMic, micMuted,
   qa, askTarget, setAskTarget, askQ, setAskQ, asking, onAsk,
   cfAgent, setCfAgent, cfTurn, setCfTurn, cfHypo, setCfHypo, onCounterfactual,
   ovDecision, setOvDecision, ovReason, setOvReason, onOverride, overrides,
@@ -18,7 +18,7 @@ export default function AskPanel({
 
       <div className="voice-join">
         {!talking ? (
-          <button className="btn-primary" onClick={onJoinVoice}>
+          <button className="btn-primary" onClick={onJoinVoice} disabled={busy}>
             <i className="ph-fill ph-microphone" aria-hidden="true" />
             Join and talk to the panel
           </button>
@@ -26,7 +26,7 @@ export default function AskPanel({
           <>
             <span className="talking-note">
               <i className="ph-fill ph-microphone" aria-hidden="true" />
-              In voice with the panel, just speak.
+              Say “Hey Liam” or “Hey Maya” to ask that interviewer directly.
               {speaking ? ` ${nameOf(speaking)} is answering.` : ""}
             </span>
             <button
@@ -60,7 +60,7 @@ export default function AskPanel({
       <div className="ask-row">
         <select value={askTarget} onChange={(e) => setAskTarget(e.target.value)}
                 aria-label="Who to ask">
-          <option value="">Open, answered by the host</option>
+          <option value="">Auto — name an interviewer or ask the host</option>
           {scores.map((s) => (
             <option key={s.agent_id} value={s.agent_id}>{nameOf(s.agent_id)}</option>
           ))}

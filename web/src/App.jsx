@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import AgoraRTC from "agora-rtc-sdk-ng";
-import { AIDenoiserExtension } from "agora-extension-ai-denoiser";
+import { Room, RoomEvent, Track, createLocalAudioTrack, createLocalVideoTrack } from "livekit-client";
 import { startGeminiCoding } from "./geminiCoding";
 
 import PanelTiles from "./components/PanelTiles";
@@ -14,11 +13,6 @@ import CodingRound, { CodingVerdict } from "./components/CodingRound";
 import Stage from "./components/Stage";
 import Timeline from "./components/Timeline";
 import { startLevelMeters, createPanner } from "./lib/audioLevel";
-
-// The denoiser's WASM is loaded from the CDN (kept out of the bundle). If the
-// browser blocks it, we fall back to the raw mic - see makeMicTrack().
-const DENOISER_ASSETS =
-  "https://cdn.jsdelivr.net/npm/agora-extension-ai-denoiser@2.0.2/external";
 
 export default function App() {
   const [agents, setAgents] = useState([]); // [{id,name,title}]
@@ -37,6 +31,7 @@ export default function App() {
   const [contradictions, setContradictions] = useState(0);
   const [report, setReport] = useState(null);
   const [scoring, setScoring] = useState(false);
+  const [modelStatus, setModelStatus] = useState(null); // reasoning-model fallback badge
   // Ask the Panel (Phase 6)
   const [askTarget, setAskTarget] = useState("");
   const [askQ, setAskQ] = useState("");
@@ -82,7 +77,7 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0);
   const [turnCount, setTurnCount] = useState(0);
   // Bumped when the inbound track arrives. remoteTrack is a ref written inside
-  // an async Agora callback, which triggers no render, so without this the
+  // an async LiveKit callback, which triggers no render, so without this the
   // level meters could start against null and never retry.
   const [remoteReady, setRemoteReady] = useState(0);
   // The interview, kept rather than discarded. Every frame is assembled from
@@ -114,7 +109,7 @@ export default function App() {
   const stopMeters = useRef(null);
   const panner = useRef(null);
   // Joining takes seconds (session start, channel join, getUserMedia, the
-  // denoiser WASM). A second click in that window would build a second client
+  // microphone permission). A second click in that window would build a second client
   // and a second audio graph, and everyone would be heard twice.
   const joining = useRef(false);
 
@@ -129,7 +124,8 @@ export default function App() {
   const cam = useRef(null);       // candidate camera track (mandatory in interview)
   const selfRef = useRef(null);   // self-view container
   const ws = useRef(null);
-  const denoiser = useRef(null);
+  const fallbackAudio = useRef(null);
+  const [audioBlocked, setAudioBlocked] = useState(false);
 
   const log = useCallback((m) => {
     const line = `[${new Date().toLocaleTimeString()}] ${m}`;
@@ -153,9 +149,9 @@ export default function App() {
   useEffect(() => { contraRef.current = contradictions; }, [contradictions]);
   useEffect(() => { elapsedRef.current = elapsed; }, [elapsed]);
 
-  // The live transcript preview is driven by the server's "partial" events (Sarvam
+  // The live transcript preview is driven by the server's "partial" events (Deepgram
   // transcribes each phrase as the candidate pauses). Browser speech recognition
-  // can't be used here — Agora holds the mic, so it would get no audio.
+  // can't be used here — LiveKit holds the mic, so it would get no audio.
 
   // Presenter mode drives a class on <html> so the token overrides reach
   // everything, including elements outside the React root.
@@ -218,7 +214,7 @@ export default function App() {
       el: stageRef.current,
       remoteTrack: remoteTrack.current,
       micTrack: (() => {
-        try { return mic.current ? mic.current.getMediaStreamTrack() : null; }
+        try { return mic.current ? mic.current.mediaStreamTrack : null; }
         catch { return null; }
       })(),
     });
@@ -247,7 +243,17 @@ export default function App() {
     sock.onmessage = (e) => {
       const ev = JSON.parse(e.data);
       if (ev.type === "panel") setAgents(ev.agents || []);
-      else if (ev.type === "thinking") {
+      else if (ev.type === "model_status") {
+        // Reasoning model changed (e.g. Gemini free-tier cap → Groq fallback).
+        setModelStatus(ev.fell_back ? ev : null);
+        if (ev.fell_back) log(`reasoning model fell back: ${ev.primary_name} → ${ev.model_name}`);
+      }
+      else if (ev.type === "voice_error") {
+        setStatus(ev.message);
+        setThinking(false);
+        setSpeaking(null);
+        log(ev.message);
+      } else if (ev.type === "thinking") {
         setThinking(true);
         setSpeaking(null);
       } else if (ev.type === "speaking") {
@@ -264,7 +270,7 @@ export default function App() {
       } else if (ev.type === "partial") {
         setLiveTranscript(ev.text || "");   // streamed transcript preview
       } else if (ev.type === "heard") {
-        setLiveTranscript("");              // final Sarvam transcript takes over
+        setLiveTranscript("");              // final Deepgram transcript takes over
         setCandCap(ev.text);
         pushFrame({ kind: "answer", text: ev.text });
       } else if (ev.type === "redo") {
@@ -309,7 +315,15 @@ export default function App() {
         setCodingResult({ verdict: ev.verdict, summary: codingSummary.current });
         stopSharing();
         stopGemini();
-        if (mic.current) { try { mic.current.setMuted(false); } catch { /* noop */ } }
+        if (mic.current) { try { mic.current.unmute().catch(() => {}); } catch { /* noop */ } }
+        // Screen share has stopped — let the audio device settle for a beat
+        // before bringing the panel's playback graph back, so the resume doesn't
+        // land mid-reconfiguration and screech. Post-coding interviewers wait a
+        // moment anyway.
+        setTimeout(() => {
+          try { panner.current?.resume(); } catch { /* noop */ }
+          try { fallbackAudio.current?.play().catch(() => {}); } catch { /* noop */ }
+        }, 500);
         log(
           ev.verdict === "cheating"
             ? "coding round flagged for outside help, handing back to the panel"
@@ -318,104 +332,112 @@ export default function App() {
       }
     };
     sock.onclose = () => log("events socket closed");
-    sock.onerror = () => log("events socket error");
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { sock.close(); reject(new Error("Events connection timed out")); }, 8000);
+      sock.onopen = () => { clearTimeout(timer); resolve(); };
+      sock.onerror = () => { clearTimeout(timer); reject(new Error("Events connection failed")); };
+    });
   }
 
-  async function makeMicTrack() {
-    // Keep AEC (echo), ANS (light noise), AND AGC (auto-gain) — AGC normalizes the
-    // level so the server's RMS gates work across mics/rooms; without it real speech
-    // fell below the threshold and got dropped. The real STT-killer was the heavy AI
-    // denoiser (it mangles phonetics), so that stays OFF. High-quality encoder keeps
-    // the signal to the bot clean.
-    const track = await AgoraRTC.createMicrophoneAudioTrack({
-      AEC: true, ANS: true, AGC: true,
-      encoderConfig: "high_quality",   // 48 kHz mono, higher bitrate
-    });
-    log("mic: high-quality profile, AEC + ANS + AGC on, AI-denoiser off");
-    return track;
-  }
-
-  async function connectAgora(s, withCamera = false) {
-    openEvents();
-    client.current = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
-    client.current.on("user-published", async (user, mt) => {
-      try {
-        await client.current.subscribe(user, mt);
-      } catch (e) {
-        // Agora does not re-emit for a failed subscribe, so without this log an
-        // audio failure is completely silent, in both senses.
-        log("subscribe failed: " + (e.message || e));
-        return;
-      }
-      if (mt === "audio") {
-        // Agora re-emits user-published after a republish or a reconnect. Without
-        // this teardown the old graph stays wired to its own destination and is
-        // unreachable, so the panel plays twice and cannot be stopped.
-        if (panner.current) { panner.current.stop(); panner.current = null; }
-
-        let track = null;
-        try { track = user.audioTrack.getMediaStreamTrack(); } catch { /* noop */ }
-        remoteTrack.current = track;
-        setRemoteReady((v) => v + 1);
-
-        // Route through our own graph so each interviewer can be panned to
-        // their seat. If that fails we hand playback straight back to Agora,
-        // so the worst case is centred audio, never silence.
-        const p = track ? createPanner(track) : null;
-        if (p) {
-          panner.current = p;
-          // Construction succeeding does not mean audio is flowing: an
-          // AudioContext built off the user gesture can stay suspended. Check
-          // shortly after and fall back on our own, because nobody can recover
-          // from silence manually mid-demo.
-          setTimeout(() => {
-            if (panner.current === p && !p.running()) {
-              p.stop();
-              panner.current = null;
-              try { user.audioTrack.play(); } catch { /* noop */ }
-              log("spatial audio did not start, fell back to plain playback");
-            }
-          }, 800);
-          log("spatial audio on, each interviewer is panned to their seat");
-        } else {
-          user.audioTrack.play();
-        }
-      }
-    });
+  async function connectLiveKit(s, withCamera = false) {
+    await openEvents();
+    const room = new Room({ adaptiveStream: true, dynacast: true });
+    client.current = room;
     const dropRemote = () => {
       if (panner.current) { panner.current.stop(); panner.current = null; }
+      if (fallbackAudio.current) {
+        fallbackAudio.current.pause();
+        fallbackAudio.current.srcObject = null;
+        fallbackAudio.current.remove();
+        fallbackAudio.current = null;
+      }
       remoteTrack.current = null;
     };
-    client.current.on("user-unpublished", (_u, mt) => { if (mt === "audio") dropRemote(); });
-    client.current.on("user-left", () => dropRemote());
-    client.current.on("connection-state-change", (state) => {
-      if (state === "DISCONNECTED" || state === "RECONNECTING") dropRemote();
+    room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+      if (track.kind !== Track.Kind.Audio || participant.identity !== "panel") return;
+      dropRemote();
+      remoteTrack.current = track.mediaStreamTrack;
+      setRemoteReady((v) => v + 1);
+      const plainPlayback = () => {
+        const element = track.attach();
+        fallbackAudio.current = element;
+        document.body.appendChild(element);
+        element.play().catch(() => setAudioBlocked(true));
+      };
+      const p = createPanner(track.mediaStreamTrack);
+      if (p) {
+        panner.current = p;
+        setTimeout(() => {
+          if (panner.current === p && !p.running()) {
+            p.stop();
+            panner.current = null;
+            plainPlayback();
+          }
+        }, 800);
+      } else plainPlayback();
     });
-    await client.current.join(s.app_id, s.channel, s.token, s.uid);
-    mic.current = await makeMicTrack();
-    const tracks = [mic.current];
+    room.on(RoomEvent.TrackUnsubscribed, (track) => {
+      if (track.kind === Track.Kind.Audio) { track.detach(); dropRemote(); }
+    });
+    room.on(RoomEvent.Reconnecting, () => setStatus("Reconnecting to the panel…"));
+    room.on(RoomEvent.Reconnected, () => setStatus("Reconnected. You can continue."));
+    room.on(RoomEvent.Disconnected, () => {
+      dropRemote();
+      setJoined(false);
+      setTalking(false);
+      setSpeaking(null);
+      setThinking(false);
+      mic.current?.stop();
+      cam.current?.stop();
+      stopSharing();
+      stopGemini();
+      setStatus("Voice disconnected. Join again to reconnect.");
+    });
+    // Acquire devices before joining so the opener cannot precede permissions.
+    mic.current = await createLocalAudioTrack({
+      echoCancellation: true, autoGainControl: true,
+      noiseSuppression: s.noise_cancellation === "off",
+      channelCount: 1,
+    });
     if (withCamera) {
-      // Camera is MANDATORY for the interview — if it can't be opened, fail the
-      // join so the candidate must grant access.
       try {
-        cam.current = await AgoraRTC.createCameraVideoTrack({ encoderConfig: "480p_1" });
+        cam.current = await createLocalVideoTrack({ resolution: { width: 640, height: 480 } });
       } catch (e) {
         throw new Error("CAMERA_REQUIRED: " + (e.message || e));
       }
-      tracks.push(cam.current);
-      if (selfRef.current) { try { cam.current.play(selfRef.current); } catch { /* noop */ } }
+      if (selfRef.current) {
+        const video = cam.current.attach();
+        video.muted = true;
+        selfRef.current.replaceChildren(video);
+      }
     }
-    await client.current.publish(tracks);
+    await room.connect(s.server_url, s.token);
+    await room.startAudio().catch(() => setAudioBlocked(true));
+    if (cam.current) await room.localParticipant.publishTrack(cam.current);
+    await room.localParticipant.publishTrack(mic.current);
+    log(`LiveKit connected; noise cancellation: ${s.noise_cancellation}; turn detector: v1-mini`);
   }
 
-  async function disconnectAgora() {
+  async function disconnectLiveKit() {
     if (stopMeters.current) { stopMeters.current(); stopMeters.current = null; }
     if (panner.current) { panner.current.stop(); panner.current = null; }
+    if (fallbackAudio.current) {
+      fallbackAudio.current.pause();
+      fallbackAudio.current.srcObject = null;
+      fallbackAudio.current.remove();
+      fallbackAudio.current = null;
+    }
     remoteTrack.current = null;
     if (ws.current) { ws.current.close(); ws.current = null; }
-    if (mic.current) { mic.current.stop(); mic.current.close(); mic.current = null; }
-    if (cam.current) { cam.current.stop(); cam.current.close(); cam.current = null; }
-    if (client.current) { try { await client.current.leave(); } catch (_) {} client.current = null; }
+    if (mic.current) { mic.current.stop(); mic.current = null; }
+    if (cam.current) { cam.current.detach(); cam.current.stop(); cam.current = null; }
+    if (client.current) {
+      client.current.removeAllListeners();
+      await client.current.disconnect();
+      client.current = null;
+    }
+    selfRef.current?.replaceChildren();
+    setAudioBlocked(false);
   }
 
   async function uploadPdf(which, fileEl) {
@@ -499,9 +521,9 @@ export default function App() {
       setScrubIndex(null);
       setAgentCap(null);
       setCandCap(null);
-      log(`channel=${s.channel} uid=${s.uid} panel=${(s.panel || []).join(",")}`);
+      log(`room=${s.room} identity=${s.identity} panel=${(s.panel || []).join(",")}`);
       setStatus("Joining the channel");
-      await connectAgora(s, true);   // camera is mandatory for the interview
+      await connectLiveKit(s, true);   // camera is mandatory for the interview
       setJoined(true);
       setMicMuted(false);
       setStatus("Live. The panel will greet you shortly.");
@@ -513,7 +535,7 @@ export default function App() {
       } else {
         setStatus("Failed to start, see the log.");
       }
-      try { await disconnectAgora(); } catch { /* cleanup */ } // don't leave a half-joined session
+      try { await disconnectLiveKit(); } catch { /* cleanup */ } // don't leave a half-joined session
       await fetch("/session/stop", { method: "POST" }).catch(() => {});
     } finally {
       joining.current = false;
@@ -522,10 +544,12 @@ export default function App() {
   }
 
   async function panelJoin() {
+    if (joining.current) return;
+    joining.current = true;
     setBusy(true);
     setStatus("Joining the panel");
     try {
-      await disconnectAgora();          // leave the interview channel first
+      await disconnectLiveKit();          // leave the interview channel first
       const resp = await fetch("/panel/join", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -533,7 +557,7 @@ export default function App() {
       });
       if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
       const s = await resp.json();
-      await connectAgora(s);
+      await connectLiveKit(s);
       setJoined(true);
       setTalking(true);
       setSpeaking(null);
@@ -545,7 +569,12 @@ export default function App() {
     } catch (e) {
       log("panel join error: " + (e.message || e));
       setStatus("Failed to join, see the log.");
+      await disconnectLiveKit().catch(() => {});
+      await fetch("/session/stop", { method: "POST" }).catch(() => {});
+      setJoined(false);
+      setTalking(false);
     } finally {
+      joining.current = false;
       setBusy(false);
     }
   }
@@ -618,7 +647,7 @@ export default function App() {
   }
 
   // Gemini Live coding round: share the ENTIRE screen, then talk + code live
-  // (browser-side). The Agora panel is muted for the duration.
+  // (browser-side). The LiveKit panel is muted for the duration.
   async function startCodingGemini() {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -635,11 +664,20 @@ export default function App() {
       screenRef.current = stream;
       stream.getVideoTracks()[0].onended = () => stopGemini();
 
+      // Quiet the LiveKit playback graph BEFORE Gemini opens its own mic/audio
+      // contexts. Otherwise the browser reconfigures the audio device while the
+      // panner is live and it screeches ("chuu chaan"). AWAIT the suspend so the
+      // graph is guaranteed silent before the device churn — fire-and-forget let
+      // an occasional burst slip through. The panel is silent during the coding
+      // round anyway; we resume it in the coding_done handler.
+      try { await panner.current?.suspend(); } catch { /* noop */ }
+      try { fallbackAudio.current?.pause(); } catch { /* noop */ }
+
       const r = await fetch("/coding/gemini-token", { method: "POST" });
       if (!r.ok) throw new Error(`token ${r.status} ${await r.text()}`);
       const { token, model } = await r.json();
 
-      if (mic.current) { try { mic.current.setMuted(true); } catch { /* noop */ } } // silence Agora panel
+      if (mic.current) { try { mic.current.mute().catch(() => {}); } catch { /* noop */ } } // silence LiveKit panel
       setGeminiActive(true);
       setStatus("Live coding. Talk and code, the interviewer can see your screen.");
       log("Gemini Live coding round started");
@@ -677,7 +715,7 @@ export default function App() {
       log("gemini coding error: " + (e.message || e));
       setStatus("Could not start live coding, see the log.");
       setGeminiActive(false);
-      if (mic.current) { try { mic.current.setMuted(false); } catch { /* noop */ } }
+      if (mic.current) { try { mic.current.unmute().catch(() => {}); } catch { /* noop */ } }
       // Tell the server so the round doesn't stall; it ends gracefully.
       try {
         await fetch("/coding/result", {
@@ -754,7 +792,7 @@ export default function App() {
     stopSharing();
     stopGemini();
     try {
-      await disconnectAgora();
+      await disconnectLiveKit();
       await fetch("/session/stop", { method: "POST" });
     } catch (e) {
       log("leave error: " + (e.message || e));
@@ -883,7 +921,9 @@ export default function App() {
 
   async function skipIntro() {
     try {
-      await fetch("/session/interrupt", { method: "POST" }); // cut the host's disclosure
+      // Dedicated endpoint: cuts the host's disclosure but lets the cold-open
+      // continue to the first question (plain /interrupt would stall it).
+      await fetch("/session/skip-intro", { method: "POST" });
       setStatus("Skipped the intro.");
       log("skipped the intro");
     } catch (e) {
@@ -891,9 +931,11 @@ export default function App() {
     }
   }
 
-  function toggleMic() {
+  async function toggleMic() {
     const next = !micMuted;
-    try { mic.current && mic.current.setMuted(next); } catch { /* noop */ }
+    try {
+      if (mic.current) await (next ? mic.current.mute() : mic.current.unmute());
+    } catch (e) { log("Microphone change failed: " + e.message); return; }
     setMicMuted(next);
     setStatus(next ? "Microphone muted." : "Microphone on.");
     log(next ? "🔇 mic muted" : "🎤 mic on");
@@ -916,7 +958,13 @@ export default function App() {
 
   async function talkAgain() {
     try {
-      await fetch("/session/redo", { method: "POST" });
+      const response = await fetch("/session/redo", { method: "POST" });
+      if (!response.ok) throw new Error(await response.text());
+      const result = await response.json();
+      if (!result.redone) {
+        setStatus("That answer has already been assessed. Please say your correction aloud.");
+        return;
+      }
       clearLive();
       setCandCap(null);
       setStatus("Okay — go ahead and say that again.");
@@ -972,6 +1020,12 @@ export default function App() {
           </p>
         </div>
         <div className="mast-right">
+          {modelStatus && (
+            <div className="model-fallback" role="status" title={`Primary reasoning model ${modelStatus.primary_name} is unavailable (free-tier cap); using the fallback.`}>
+              <i className="ph-fill ph-warning-circle" aria-hidden="true" />
+              {modelStatus.primary_name} limit reached — falling back to {modelStatus.model_name}
+            </div>
+          )}
           <div className="disclosure" role="note">
             <span className="dot" aria-hidden="true" />
             Every interviewer is AI. This session is recorded and transcribed.
@@ -988,6 +1042,17 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {audioBlocked && (
+        <button className="btn-primary" onClick={async () => {
+          try {
+            await client.current?.startAudio();
+            await panner.current?.resume();
+            await fallbackAudio.current?.play();
+            setAudioBlocked(false);
+          } catch (e) { log("Audio playback blocked: " + e.message); }
+        }}>Enable panel audio</button>
+      )}
 
       <nav className="nav">
         <button className={showRoom ? "nav-on" : ""} onClick={() => switchView("room")}>
@@ -1127,7 +1192,7 @@ export default function App() {
           }
         >
           <AskPanel
-            report={report} nameOf={nameOf} talking={talking} speaking={speaking}
+            report={report} nameOf={nameOf} talking={talking} speaking={speaking} busy={busy}
             onJoinVoice={panelJoin}
             onToggleMic={toggleMic} micMuted={micMuted}
             qa={qa}

@@ -10,12 +10,13 @@ from pydantic import BaseModel, Field
 
 
 class SessionStartResponse(BaseModel):
-    """What the media worker hands back so the browser can join Agora."""
-    app_id: str          # Agora App ID the web SDK needs
-    channel: str         # channel both candidate and bot join
-    uid: int             # numeric uid assigned to the candidate (browser)
-    token: str           # candidate's join token, scoped to (channel, uid)
-    panel: list[str] = Field(default_factory=list)  # active interviewer ids (§9 dossier)
+    """Short-lived, room-scoped credentials for the LiveKit browser client."""
+    server_url: str
+    room: str
+    identity: str
+    token: str
+    noise_cancellation: str
+    panel: list[str] = Field(default_factory=list)
 
 
 class Dossier(BaseModel):

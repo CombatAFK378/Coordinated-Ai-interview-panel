@@ -3,23 +3,36 @@
 #
 # Code is mounted as volumes + uvicorn --reload, so editing Python files takes
 # effect without rebuilding the image (only requirements changes need a rebuild).
+name: interviewer-livekit
+
 services:
   media-worker:
     build:
       context: .
       dockerfile: media-worker/Dockerfile
-    env_file: .env
+    image: interviewer-livekit:local
+    init: true
     ports:
-      - "8080:8080"
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    stop_grace_period: 30s
     volumes:
+      # .env is MOUNTED (not baked via env_file), so the app reads current values
+      # at startup. Change .env then `docker compose restart` (or up) — no
+      # --force-recreate needed, because nothing is copied into the container's
+      # environment at create time.
+      - ./.env:/app/.env:ro
       # Backend code is mounted for --reload. The frontend is NOT mounted: it's
       # built into the image (dist/). For live frontend dev run `cd web && npm run
       # dev` (Vite :5173 proxies the API to this worker).
       - ./media-worker:/app/media-worker
       - ./shared:/app/shared
-      # Downloaded Smart Turn weights (see models/README.md). Mounting keeps the
-      # large .onnx on the host so it survives rebuilds and isn't baked in.
-      - ./models:/app/models
       # Persisted interviews (Phase 8): recruiter dashboard reads/writes here.
       - ./data:/app/data
-    command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload
+    # Watch both mounted code dirs so edits to shared/ hot-reload too (default
+    # --reload only watches the app dir, /app/media-worker).
+    command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload --reload-dir /app/media-worker --reload-dir /app/shared

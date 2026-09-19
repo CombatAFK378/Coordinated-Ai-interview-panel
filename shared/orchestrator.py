@@ -16,7 +16,7 @@ Coverage comes from the evidence ledger (Phase 4); until then it is 0, so gap is
 1 and routing is interest+recency driven — enough for the PS11 routing demo.
 
 This module is import-safe and stateless-per-call except FloorController, which
-holds one interview's live turn state. It has no web framework or Agora
+holds one interview's live turn state. It has no web framework or voice transport
 dependency, so it lifts cleanly into the standalone Orchestrator service later
 (§13.1) without a rewrite.
 """
