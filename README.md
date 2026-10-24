@@ -20,14 +20,10 @@ record, never from imagination.
 - [How an interview works](#how-an-interview-works)
 - [The panel](#the-panel)
 - [Ask the Panel](#ask-the-panel)
+- [Design principles](#design-principles)
 - [Architecture](#architecture)
 - [Getting started](#getting-started)
 - [Using it](#using-it)
-- [Configuration reference](#configuration-reference)
-- [Project layout](#project-layout)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
-- [Design principles](#design-principles)
 
 ---
 
@@ -132,6 +128,17 @@ phone; text chat only on WhatsApp:
 | Browser | Open the interview's report (now, or later from **Past interviews**) → **Join and talk to the panel** | Live voice — each interviewer speaks in their own voice |
 | Phone | Call the panel's number; Julian asks which interview | Live voice — each interviewer speaks in their own voice |
 | WhatsApp | Message the panel's number; Julian lists interviews | Text chat — each reply headed with who's answering, e.g. `*Liam · Coding Interviewer*` |
+
+## Design principles
+
+1. Floor control is deterministic code, never a model — same inputs, same speaker.
+2. Agent isolation is enforced in the prompt builder, not by convention.
+3. Conviction is computed in code; a STRONG hold cannot be overridden by model output.
+4. Scores are never averaged — the split is the output.
+5. Ask the Panel answers only from the stored record. Not written down → "I don't have that."
+6. Counterfactuals never mutate the locked record; the hash always verifies.
+7. Low confidence reallocates time; it never ends an interview early.
+8. The system recommends. A human decides — and every override is logged.
 
 ## Architecture
 
@@ -355,117 +362,3 @@ One call at a time; a call is refused while a candidate interview is live.
 Only the webhook is reachable through the tunnel — everything else answers 404 —
 and every request must carry a valid Twilio signature. To clear every chat's state
 from the terminal: `rm -f data/whatsapp/*.json`.
-
-## Configuration reference
-
-All settings live in `.env` (see `.env.example`). The most useful:
-
-| Key | Default | What it does |
-|---|---|---|
-| `LLM_FAST_MODEL` / `LLM_FALLBACK_CHAIN` | `ollama:gpt-oss:120b` / Groq, Gemini | Interviewer model and its fallbacks |
-| `LLM_REASONING_MODEL` / `LLM_REASONING_FALLBACKS` | `ollama:minimax-m3` / Gemini, Groq | Orchestrator model and its fallbacks |
-| `ALLOW_BARGEIN` | `true` | Whether talking over an interviewer interrupts them (use `false` on speakers; **Interrupt** always works; Ask the Panel is always interruptible) |
-| `LIVEKIT_NOISE_CANCELLATION` | `bvc` | `bvc` / `nc` need LiveKit Cloud; `off` for self-hosted LiveKit |
-| `LIVEKIT_ENDPOINTING_MIN_DELAY` / `MAX_DELAY` | `0.5` / `4.0` | How long the turn detector may wait through a pause (seconds) |
-| `INTERVIEW_TIME_BUDGET_S` | `1200` | Interview length the floor-control ramp is planned around |
-| `PHONE_AGENT_NAME` | `panel-phone` | Agent name the phone dispatch rule targets (empty disables the phone line) |
-| `LOCAL_TIMEZONE` | `Asia/Kolkata` | Time zone for "the 4:30 interview" and spoken/listed times |
-| `APP_PORT` | `8080` | Host port for the app |
-
-Model ids carry a provider prefix (`ollama:`, `groq:`, `gemini:`, `openrouter:`).
-
-## Project layout
-
-```
-media-worker/          FastAPI app (runs in Docker)
-  main.py                HTTP API, session lifecycle, WhatsApp webhook, tunnel guard
-  livekit_session.py     LiveKit voice I/O: BVC, STT, turn detection, per-persona TTS
-  pipeline.py            the live interview: bids, floor, ledger, coding round
-  ask_pipeline.py        Ask the Panel by voice (browser and phone), overrides
-  phone_line.py          registers the worker for inbound calls
-  phone_setup.py         one-time phone dispatch-rule setup
-  whatsapp.py            Ask the Panel on WhatsApp
-shared/                the panel's brain, shared by every surface
-  prompts.py             personas and every prompt (the isolation boundary)
-  orchestrator.py        bidding and deterministic floor control
-  ledger.py, competencies.py   evidence and coverage
-  scoring.py             blind scoring, conviction, hash, debate, conclusion
-  dossier.py             JD + résumé → panel, weights, rubrics, claims
-  ask_panel.py           grounded answers, counterfactuals, overrides
-  interview_lookup.py    "Vikram's 4:30 interview" → a saved interview
-  llm_router.py          every LLM call, with fallbacks
-  config.py, store.py    settings and JSON persistence
-web/                   React + Vite frontend (built into the image)
-tests/                 pytest suite — runs offline, no keys needed
-livekit-interviewer.md architecture contract (data model, invariants, failure modes)
-ARCHITECTURE.md        original design contract
-```
-
-## Testing
-
-**Automated** (inside the image built by `docker compose up --build`; no network or
-keys needed):
-
-```bash
-docker run --rm -v "$PWD:/app" -w /app -e DATA_DIR=/tmp/d interviewer-livekit:local \
-  sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q"
-```
-
-Covers room-scoped tokens, name routing and word boundaries, sticky addressing,
-absent interviewers, override detection (including typos), report immutability,
-the model router and its fallbacks, interview lookup, the phone lobby, WhatsApp
-chat flows, Twilio signatures and the tunnel guard. Frontend: `cd web && npm ci &&
-npm run build`.
-
-**Live checks before a demo** (need real keys and microphones):
-
-1. Join an interview: Julian's disclosure and Maya's opener are audible, with
-   captions; a mid-sentence pause is waited through; **Done** and **Talk again** work.
-2. **Interrupt** an interviewer and ask something else — no stale reply follows.
-3. Coding round: share the entire screen; open an AI chat to confirm it's flagged.
-4. **Finish and score**, then reopen it from **Past interviews**.
-5. Ask the Panel: *"Hey Liam, why that score?"*, an unnamed follow-up, *"Hey
-   Maya…"*; ask an interviewer who wasn't seated; *"Why did you reject the
-   candidate?"* must **not** create an override; override and check the original
-   stays on record.
-6. Call the phone number and run through a lookup, a question and a goodbye.
-7. On WhatsApp: `hi` → pick → question → override → `menu` → `reset`.
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| "Camera is required for the interview" | Allow camera access and click **Join interview** again |
-| No panel audio | Click **Enable panel audio** (the browser blocked autoplay) |
-| Echo or the panel cutting itself off | Use headphones, or set `ALLOW_BARGEIN=false` |
-| Header badge "… limit reached — falling back to …" | The primary model is rate-limited or down; the fallback is serving |
-| Phone call rings but stays silent | Check the log for `registered worker`; calls are refused while an interview is live |
-| WhatsApp message gets no reply | Check Twilio's sandbox URL is exactly `https://<NGROK_DOMAIN>/whatsapp/webhook` and **saved**; re-send `join <code>` if 3 days have passed |
-| WhatsApp webhook returns 403 | The URL saved in Twilio doesn't match the one Twilio is calling |
-| `docker compose up` hangs on reload | `docker compose restart -t 3 media-worker` |
-
-## Design principles
-
-1. Floor control is deterministic code, never a model — same inputs, same speaker.
-2. Agent isolation is enforced in the prompt builder, not by convention.
-3. Conviction is computed in code; a STRONG hold cannot be overridden by model output.
-4. Scores are never averaged — the split is the output.
-5. Ask the Panel answers only from the stored record. Not written down → "I don't have that."
-6. Counterfactuals never mutate the locked record; the hash always verifies.
-7. Low confidence reallocates time; it never ends an interview early.
-8. The system recommends. A human decides — and every override is logged.
-
-## Versions
-
-Verified stable releases:
-
-| Package | Version |
-|---|---|
-| LiveKit Agents / Deepgram / Silero Python plugins | 1.8.2 |
-| LiveKit noise cancellation | 0.3.2 |
-| LiveKit API | 1.2.1 |
-| Browser `livekit-client` | 2.22.3 |
-| ngrok agent (Docker) | 3.39.13 |
-
-LiveKit Agents pins its compatible RTC SDK (`livekit==1.1.18`); update the Python
-plugin group together and rebuild.
