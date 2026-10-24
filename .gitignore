@@ -10,10 +10,6 @@ __pycache__/
 *.env
 !.env.example
 
-# Models (downloaded weights)
-models/*.onnx
-models/*.jit
-
 # Node / web
 web/node_modules/
 web/dist/
@@ -28,13 +24,6 @@ Thumbs.db
 *.log
 _tmp*/
 _ref/
-agora_rtc_log/
-
-# Agora SDK runtime cache
-agora_cache.db
-agoradns.dat
-agorareport.dat
-**/agorareport.dat
 
 # Claude Code local settings
 .claude/

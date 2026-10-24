@@ -69,8 +69,7 @@ FastAPI worker
 
 The optional browser Gemini Live coding session still receives screen frames
 and supplies its coding assessment. The LiveKit microphone is muted while that
-session owns the coding round. No public custom-LLM callback or tunnel is needed
-for local voice sessions.
+session owns the coding round.
 
 ### Model routing
 
@@ -570,10 +569,9 @@ screen in real time (feedback + outside-AI-help detection). Confidence trajector
 chart. Spoken AI disclosure and persistent badge. Recruiter dashboard. Mandatory
 camera, mic toggle, live captions, and per-session logging.
 
-**Phase 9 — LiveKit migration.**
+**Phase 9 — LiveKit voice.**
 Both voice flows run on LiveKit with named persona voices, BVC and local v1-mini
-turn detection. The migration branch removes the previous RTC/CAI stack from the
-Docker image; the existing main branch retains it for rollback.
+turn detection — one participant that speaks as any interviewer.
 
 Phases 1–6 are the product. Phases 7–9 are what make it a demo people remember.
 

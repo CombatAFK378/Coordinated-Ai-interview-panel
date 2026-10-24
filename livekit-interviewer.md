@@ -6,8 +6,8 @@ that decides who speaks. Scores are private during the interview, locked at the
 end, then debated. A recruiter can rejoin the session later and cross-examine
 any interviewer about its reasoning.
 
-This document is the implementation contract for the **LiveKit build** — the final
-end-to-end architecture: LiveKit for real-time voice, MiniMax M3 on Ollama Cloud
+This document is the implementation contract — the end-to-end architecture:
+LiveKit for real-time voice, MiniMax M3 on Ollama Cloud
 as the reasoning model, and Postgres + Redis as the persistence layer. It describes
 structure, data flow and invariants — not code.
 
@@ -85,7 +85,7 @@ FastAPI worker
 
 The browser Gemini Live coding session receives screen frames and supplies its
 coding assessment. The LiveKit microphone is muted while that session owns the
-coding round. No public custom-LLM callback or tunnel is needed for voice.
+coding round.
 
 ### Model routing
 
@@ -645,8 +645,7 @@ camera, mic toggle, live captions, and per-session logging.
 
 **Phase 9 — LiveKit voice.**
 Both voice flows run on LiveKit with named persona voices, BVC and local v1-mini
-turn detection — one participant that speaks as any interviewer, removing the
-single-voice limit of the earlier managed-agent transport.
+turn detection — one participant that speaks as any interviewer.
 
 Phases 1–6 are the product. Phases 7–9 are what make it a demo people remember.
 
@@ -700,8 +699,8 @@ Voice assignment (Deepgram Aura, one voice per agent):
 | Orchestrator | Julian | `aura-2-draco-en` (British male, baritone) |
 
 Voices vary accent, pitch and pace, not just gender — the candidate must never
-wonder who is speaking. These assignments apply in both voice modes; the CAI-free
-LiveKit transport is what lets one participant carry all six.
+wonder who is speaking. These assignments apply in every voice mode (interview,
+Ask the Panel in the browser and by phone); one LiveKit participant carries all six.
 
 ---
 

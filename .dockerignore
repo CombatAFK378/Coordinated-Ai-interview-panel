@@ -7,9 +7,6 @@ venv/
 .env
 web/node_modules/
 web/dist/
-models/*.onnx
-models/*.jit
-agora_rtc_log/
 *.log
 .DS_Store
 
