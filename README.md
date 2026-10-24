@@ -1,9 +1,12 @@
 # 968ms — Coordinated AI Interview Panel
 
-A live AI interview panel with five specialized interviewers and a host. This
-branch uses **LiveKit** for both the candidate interview and recruiter Q&A.
-Panel bidding, evidence, independent scores, debate, dossiers, saved reports and
-the optional Gemini Live coding round retain their existing domain logic.
+A live AI interview panel with five specialized interviewers and a host, over
+**LiveKit** real-time voice. A JD + résumé dossier seats the right interviewers; a
+deterministic floor-control formula decides who speaks next; each interviewer
+scores privately, and the locked, hashed scores are debated into a
+recommendation. An optional Gemini Live coding round watches the candidate's
+screen. Afterwards a recruiter can cross-examine the panel in the browser, by
+phone, or on WhatsApp.
 
 ## Ask the Panel
 
@@ -64,13 +67,13 @@ and every request must carry a valid Twilio signature.
 ```
 microphone → LiveKit room → BVC → Silero + Deepgram streaming STT
                               → LiveKit audio turn detector v1-mini
-                              → existing interview / grounded Q&A brain
+                              → interview / grounded Q&A brain
                               → selected persona's Deepgram streaming TTS
                               → LiveKit room → browser speaker
 ```
 
 - `v1-mini` is the **audio** turn detector bundled in LiveKit Agents, explicitly
-  selected in every environment. The old text turn-detector plugin is not used.
+  selected in every environment.
 - BVC removes background voices as well as noise and **requires LiveKit Cloud**.
   Use `LIVEKIT_NOISE_CANCELLATION=off` with a self-hosted LiveKit server. Browser
   echo cancellation remains enabled; browser noise suppression is off when BVC
@@ -82,8 +85,7 @@ microphone → LiveKit room → BVC → Silero + Deepgram streaming STT
 
 ## Run with Docker
 
-1. For a fresh setup, copy `.env.example` to `.env`. For an existing setup, keep
-   your `.env` and add the new LiveKit fields; do not overwrite provider keys.
+1. Copy `.env.example` to `.env`.
 2. Set `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` from your
    [LiveKit Cloud project](https://cloud.livekit.io/). Keep `DEEPGRAM_API_KEY` for
    both streaming STT and TTS. Set `OLLAMA_API_KEY` (Ollama Cloud runs both the
@@ -99,19 +101,12 @@ in `./data`. For frontend development, run `cd web && npm ci && npm run dev`.
 Use one Uvicorn worker: active session state is currently in memory and the app
 supports one interview or recruiter voice session at a time.
 
-## Branch and rollback
+## Ports and data
 
-The migration is on `codex/livekit-migration`. Agora code and dependencies are
-removed from this branch's runtime. The existing `main` branch retains Agora;
-there is no need to install both SDK stacks in the same image. Existing local
-Agora credentials and downloaded model files can be retained for rollback.
-
-Compose uses the separate project `interviewer-livekit` and image
-`interviewer-livekit:local`. Set `APP_PORT=8081` to run alongside an existing
-Agora container on 8080. Do not edit a shared checkout while running both code
-mounted containers; use separate checkouts for simultaneous operation. The data
-folder is shared with the current checkout, so back it up before demos that write
-reports. Stop this project with `docker compose down`; no data volumes are erased.
+Compose runs the project `interviewer-livekit` (image `interviewer-livekit:local`)
+on port 8080; set `APP_PORT` in `.env` to use another port. Saved interviews,
+WhatsApp chat state and per-session logs live in `./data`, which survives
+`docker compose down`; back it up before demos that write reports.
 
 ## Versions and checks
 
@@ -134,10 +129,10 @@ python -m pytest
 cd web && npm ci && npm run build
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and
-[the migration checklist](docs/livekit-migration.md) for the design and live
-acceptance checks. LiveKit Cloud/BVC, Deepgram and LLM calls require working keys;
-a successful build alone does not verify microphone quality or live routing.
+See [livekit-interviewer.md](livekit-interviewer.md) for the architecture and
+model routing, and [ARCHITECTURE.md](ARCHITECTURE.md) for the original design
+contract. LiveKit Cloud/BVC, Deepgram and LLM calls require working keys; a
+successful build alone does not verify microphone quality or live routing.
 
 References: [LiveKit turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/),
 [noise cancellation plugin](https://pypi.org/project/livekit-plugins-noise-cancellation/).
