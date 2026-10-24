@@ -1,4 +1,4 @@
-"""Find the saved interview a recruiter means ("Shashank's 4:30 interview").
+"""Find the saved interview a recruiter means ("Vikram's 4:30 interview").
 
 Shared by Ask the Panel by phone and on WhatsApp. The fast model only PARSES the
 request into hints — a name as heard, a time, a day. Matching those hints against
@@ -96,8 +96,8 @@ def _tokens(s: str) -> list[str]:
 
 def name_score(heard: str, saved: str) -> float:
     """Best fuzzy match between any heard word and any word of the saved name.
-    Saved names are usually first names only, so "Shashank Upadhyay" must match
-    "Shashank"."""
+    Saved names are usually first names only, so "Vikram Rao" must match
+    "Vikram"."""
     h, s = _tokens(heard), _tokens(saved)
     if not h or not s:
         return 0.0
@@ -216,7 +216,7 @@ def wants_other_interview(text: str, current_candidate: str, rows: list[dict]) -
 
 
 def describe(row: dict, current: datetime) -> str:
-    """Spoken form: "Shashank, AI Engineer, today at 4:30 PM"."""
+    """Spoken form: "Vikram, AI Engineer, today at 4:30 PM"."""
     w = _when(row, current.tzinfo)
     days = (current.date() - w.date()).days
     if days == 0:

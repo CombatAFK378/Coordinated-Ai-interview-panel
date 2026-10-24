@@ -6,9 +6,11 @@ A live, voice-first AI interview panel. Five AI interviewers and a host intervie
 candidate together over real-time voice, each probing a different side of the role.
 A deterministic formula decides who speaks next. Each interviewer scores privately;
 the scores are locked, hashed and debated into a recommendation. Afterwards a
-recruiter can **cross-examine the panel** about that locked verdict — in the
-browser, by **phone**, or on **WhatsApp** — and every interviewer answers in their
-own voice (or under their own name) from the record, never from imagination.
+recruiter can **join the completed interview's panel** — right after it ends or any
+time later — and **talk to the interviewers by voice** about their verdict, in the
+browser or on a **phone call**, or chat with them on **WhatsApp**. Every interviewer
+answers in their own voice (on WhatsApp, under their own name) from the locked
+record, never from imagination.
 
 ---
 
@@ -48,9 +50,11 @@ own voice (or under their own name) from the record, never from imagination.
 - **A defensible verdict.** Blind, independent scoring per interviewer; a SHA-256
   lock over the record; a debate where a confident interviewer cannot be talked out
   of their score; a conclusion that reports the split instead of averaging it.
-- **Cross-examination anywhere.** Ask the Panel in the browser, on a phone call, or
-  in a WhatsApp chat. Answers come only from the locked record; recruiter overrides
-  are logged next to the original call, which never changes.
+- **Talk to the panel afterwards.** A recruiter can join any completed interview's
+  panel — straight after it, or days later — and talk to the interviewers by voice,
+  in the browser or over a phone call, or chat with them on WhatsApp. Answers come
+  only from the locked record; recruiter overrides are logged next to the original
+  call, which never changes.
 
 ## How an interview works
 
@@ -100,10 +104,13 @@ their prompts.
 
 ## Ask the Panel
 
-After scoring, the record is frozen — and it can be questioned:
+Once an interview is scored, its record is locked — but its panel stays available.
+A recruiter **joins that completed interview's panel** — right after the interview,
+or at their own convenience later — and **talks to the AI interviewers by voice**,
+as if the panel were still in the room:
 
-- *"Hey Liam, why did you give that coding score?"* → Liam answers, citing what the
-  candidate actually said.
+- *"Hey Liam, why did you give that coding score?"* → Liam answers, in his own
+  voice, citing what the candidate actually said.
 - Follow-ups without a name stay with whoever answered; address Julian (or "the
   panel") to go back to the host.
 - An interviewer who wasn't seated for that role says they didn't assess the
@@ -117,13 +124,14 @@ After scoring, the record is frozen — and it can be questioned:
   model, and logged with the reason; the panel's original recommendation stays on
   the record.
 
-It works on three surfaces — the same record and the same rules:
+Three ways in — the same record and the same rules. Voice in the browser and on the
+phone; text chat only on WhatsApp:
 
-| Surface | How you reach it | Who's speaking |
+| Where | How you join | The conversation |
 |---|---|---|
-| Browser | Report page → *Join and talk to the panel*, or type | Each interviewer's own voice |
-| Phone | Call the panel's number; Julian asks which interview | Each interviewer's own voice |
-| WhatsApp | Message the panel's number; Julian lists interviews | A header on each reply: `*Liam · Coding Interviewer*` |
+| Browser | Open the interview's report (now, or later from **Past interviews**) → **Join and talk to the panel** | Live voice — each interviewer speaks in their own voice |
+| Phone | Call the panel's number; Julian asks which interview | Live voice — each interviewer speaks in their own voice |
+| WhatsApp | Message the panel's number; Julian lists interviews | Text chat — each reply headed with who's answering, e.g. `*Liam · Coding Interviewer*` |
 
 ## Architecture
 
@@ -258,28 +266,37 @@ the log shows `registered worker` (and, with WhatsApp configured, ngrok's
   evidence.
 - **locked record, SHA-256 …** — the hash of the locked record.
 
-### 3. Ask the Panel in the browser
+### 3. Ask the Panel in the browser (voice)
 
-Below the report:
+Ask the Panel sits below the report — right after **Finish and score**, or whenever
+you open an interview from **Past interviews**.
 
-- **Join and talk to the panel** — then just talk: *"Hey Liam, why that coding
-  score?"*, *"and what was missing?"*, *"Maya, what concerned you?"*,
-  *"Julian, what's the overall call?"* You can cut anyone off by speaking.
-  **Leave voice** when done.
-- **Or type:** pick **Auto — name an interviewer or ask the host** or a specific
-  interviewer, type the question, press **Ask**.
+1. Click **Join and talk to the panel.** You join the completed interview's panel
+   in a live voice room (no camera needed); Julian welcomes you back and tells you
+   the panel's call.
+2. **Talk to them by name:** *"Hey Liam, why that coding score?"*, *"and what was
+   missing?"*, *"Maya, what concerned you?"*, *"Julian, what's the overall call?"*
+   Each interviewer answers in their own voice, from the locked record. Follow-ups
+   stay with whoever answered; you can cut anyone off just by speaking.
+3. To overrule the panel, say *"override to proceed"* or *"decline the
+   candidate"* — it's logged, and the original call stays on record.
+4. **Leave voice** when you're done.
+
+Alongside the voice room, the report page also has two forms:
+
 - **Counterfactual, what if they had said this:** choose the interviewer, the turn,
   and a better answer → **Re-score** shows how that one score would move. The
   locked score is unchanged.
 - **Override the recommendation:** choose the decision, give a reason → **Log
-  override**. In voice, saying *"override to proceed"* / *"decline the candidate"*
-  works too.
+  override**.
 
-### 4. Past interviews
+### 4. Past interviews — rejoin any panel, any time
 
-The **Past interviews** tab lists every scored interview — candidate, role,
-headline, recommendation (and any override). Click one to open its report, then
-**Join and talk to the panel** to question that interview again.
+Every scored interview is kept. The **Past interviews** tab lists them — candidate,
+role, headline, recommendation (and any override). A recruiter can come back at
+their own convenience — hours or days later — open any past interview, and click
+**Join and talk to the panel** to rejoin that interview's panel and talk to the AI
+interviewers by voice, exactly as if the interview had just finished.
 
 ### 5. Ask the Panel by phone
 
@@ -297,7 +314,7 @@ headline, recommendation (and any override). Click one to open its report, then
 **On the call**
 
 1. Dial the number. Julian: *"Which interview would you like to talk about?"*
-2. Say *"Shashank's 4:30 interview"* (name, time, or both; "yesterday" or a weekday
+2. Say *"Vikram's 4:30 interview"* (name, time, or both; "yesterday" or a weekday
    works too). If several fit, Julian lists them — answer *"the second one"* or give
    the time; if one fits, *"yes"*.
 3. Ask the panel by name, as in the browser.
@@ -326,7 +343,7 @@ One call at a time; a call is refused while a candidate interview is live.
 | Send | What happens |
 |---|---|
 | `hi` | Julian introduces himself and lists recent interviews, numbered |
-| `2` · `Priya` · `Shashank's 4:30 interview` | Loads that interview (or asks which one) |
+| `2` · `Priya` · `Vikram's 4:30 interview` | Loads that interview (or asks which one) |
 | `Liam, why that score?` | Liam answers — the reply is headed `*Liam · Coding Interviewer*` |
 | `and what was missing?` | Follow-up stays with Liam |
 | `Julian, overall?` | Back to the host |
@@ -375,7 +392,7 @@ shared/                the panel's brain, shared by every surface
   scoring.py             blind scoring, conviction, hash, debate, conclusion
   dossier.py             JD + résumé → panel, weights, rubrics, claims
   ask_panel.py           grounded answers, counterfactuals, overrides
-  interview_lookup.py    "Shashank's 4:30 interview" → a saved interview
+  interview_lookup.py    "Vikram's 4:30 interview" → a saved interview
   llm_router.py          every LLM call, with fallbacks
   config.py, store.py    settings and JSON persistence
 web/                   React + Vite frontend (built into the image)

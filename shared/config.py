@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # sends calls to the panel's number to an agent of this name; the worker
     # registers under it at startup. Empty disables the phone line.
     phone_agent_name: str = "panel-phone"
-    # Time zone the caller speaks in ("Shashank's 4:30 interview"), used to match
+    # Time zone the caller speaks in ("Vikram's 4:30 interview"), used to match
     # and read out interview times.
     local_timezone: str = "Asia/Kolkata"
 

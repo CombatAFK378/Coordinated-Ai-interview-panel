@@ -2,7 +2,7 @@
 
 In the browser the recruiter has already opened an interview. On the phone the
 call starts with no record: Julian asks which interview, the caller names it
-("Shashank's 4:30 interview"), and the panel then answers from that record. The
+("Vikram's 4:30 interview"), and the panel then answers from that record. The
 caller can switch interviews mid-call or say goodbye to hang up.
 """
 import difflib

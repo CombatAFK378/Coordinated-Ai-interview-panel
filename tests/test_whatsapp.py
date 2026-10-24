@@ -31,7 +31,7 @@ def wa_settings(settings, tmp_path):
 @pytest.fixture
 def chat(wa_settings, record, monkeypatch):
     """Chats with three saved interviews, a fake parser and a fake panel."""
-    hints = {"Shashank's 4:30 interview": Hints(name='Shashank', minutes=990),
+    hints = {"Vikram's 4:30 interview": Hints(name='Vikram', minutes=990),
              "now let's talk about Priya's interview": Hints(name='Priya')}
     monkeypatch.setattr(whatsapp.store, 'list_summaries', lambda: list(ROWS))
     monkeypatch.setattr(whatsapp.store, 'load_record', lambda iid: record)
@@ -52,8 +52,8 @@ def chat(wa_settings, record, monkeypatch):
 def test_greeting_lists_interviews(chat):
     chat.handle(NUMBER, 'Hi')
     assert chat.sent[-1].startswith("*Julian · Host*\nHi, I'm Julian")
-    assert '1. Shashank, Backend Engineer, today at 4:28 PM' in chat.sent[-1]
-    assert '3. Shashank, Backend Engineer, yesterday at 10:15 AM' in chat.sent[-1]
+    assert '1. Vikram, Backend Engineer, today at 4:28 PM' in chat.sent[-1]
+    assert '3. Vikram, Backend Engineer, yesterday at 10:15 AM' in chat.sent[-1]
 
 
 def test_pick_by_number_then_named_question_and_followup(chat):
@@ -70,8 +70,8 @@ def test_pick_by_number_then_named_question_and_followup(chat):
 
 
 def test_name_lookup_then_switch(chat):
-    chat.handle(NUMBER, "Shashank's 4:30 interview")
-    assert 'Got it: Shashank, Backend Engineer, today at 4:28 PM' in chat.sent[-1]
+    chat.handle(NUMBER, "Vikram's 4:30 interview")
+    assert 'Got it: Vikram, Backend Engineer, today at 4:28 PM' in chat.sent[-1]
     chat.handle(NUMBER, "now let's talk about Priya's interview")
     assert 'Got it: Priya' in chat.sent[-1]
 
