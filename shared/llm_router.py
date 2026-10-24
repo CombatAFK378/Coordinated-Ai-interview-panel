@@ -11,14 +11,15 @@ error.
 
 Model ids may carry a provider prefix so one chain can span providers:
 
-    groq:openai/gpt-oss-120b            -> Groq        (fast, sub-second)
+    ollama:gpt-oss:120b                 -> Ollama Cloud (primary, Pro plan)
+    groq:openai/gpt-oss-120b            -> Groq        (fast, free-tier key pool)
+    gemini:gemini-2.5-flash             -> Gemini
     openrouter:nvidia/nemotron-...:free -> OpenRouter
     nvidia/nemotron-...:free            -> OpenRouter  (default, no prefix)
 
-Both providers speak the OpenAI chat-completions shape, so the request/response
+All providers speak the OpenAI chat-completions shape, so the request/response
 handling is identical; only the base URL and key differ. If a model's provider
-has no key configured, that entry is skipped and the chain moves on — so the fast
-path falls back to OpenRouter until a Groq key is set, then speeds up for free.
+has no key configured, that entry is skipped and the chain moves on.
 
 The shared Redis token bucket for global rate limiting (ARCHITECTURE §8) is a
 scaling concern for many concurrent interviews and lands with the storage layer;
@@ -52,8 +53,10 @@ def _next_key(keys: list[str]) -> str:
 # provider name -> (chat-completions URL, Settings attribute holding the key)
 # Google exposes an OpenAI-compatible endpoint, so Gemini plugs in like the others
 # (same request/response shape, Bearer auth) — used for the reasoning model, which
-# the free OpenRouter tiers can no longer serve reliably.
+# the free OpenRouter tiers can no longer serve reliably. Ollama Cloud's OpenAI-
+# compatible endpoint is the primary for both the fast path and the reasoning model.
 PROVIDERS = {
+    "ollama": ("https://ollama.com/v1/chat/completions", "ollama_api_key"),
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "openrouter_api_key"),
     "groq": ("https://api.groq.com/openai/v1/chat/completions", "groq_api_key"),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini_api_key"),
@@ -85,11 +88,11 @@ def chat(
     `model` is the preferred id (defaults to the fast model); the configured
     fallback chain is appended after it. Raises LLMError if all fail.
 
-    `reasoning_effort` ("low"/"medium"/"high") caps how much a reasoning model
-    thinks before answering. gpt-oss reasons by default, which with a tight
+    `reasoning_effort` ("low"/"medium"/"high"/"none") caps how much a reasoning
+    model thinks before answering. gpt-oss reasons by default, which with a tight
     max_tokens can eat the whole budget and return empty content — "low" keeps
-    the fast path fast and non-empty. It's only sent to gpt-oss models; other
-    models use a different knob, so it's dropped for them rather than erroring.
+    the fast path fast and non-empty. Other thinking models get thinking turned
+    off instead (see `_effort_for`), so any model in the chain can serve the call.
     """
     settings = get_settings()
     primary = model or settings.llm_fast_model
@@ -112,12 +115,13 @@ def chat(
             logger.warning("skipping %s: no key configured", model_id)
             continue
 
+        effort = _effort_for(provider, bare_model, reasoning_effort)
         for attempt in range(retries + 1):
             api_key = _next_key(keys)   # rotate each attempt so a 429 retries on a fresh key
             try:
                 return _call(
                     url, api_key, bare_model, messages,
-                    temperature, max_tokens, timeout, reasoning_effort,
+                    temperature, max_tokens, timeout, effort,
                 )
             except _Transient as e:
                 last_err = e
@@ -233,6 +237,24 @@ def _split(model_id: str) -> tuple[str, str]:
     return DEFAULT_PROVIDER, model_id
 
 
+def _effort_for(provider: str, model_id: str, reasoning_effort: str | None) -> str | None:
+    """The reasoning_effort actually sent for this model, or None to omit it.
+
+    Thinking tokens count against max_tokens. gpt-oss always reasons, so the
+    caller's effort ("low") just caps it. Gemini 2.5 and Ollama's thinking models
+    (MiniMax, GLM) think by default and truncate the JSON or the spoken line, so
+    whenever a caller asks for an effort they get thinking turned OFF. Other
+    models have no such knob, so it's dropped rather than erroring.
+    """
+    if not reasoning_effort:
+        return None
+    if "gpt-oss" in model_id:
+        return reasoning_effort
+    if provider == "ollama" or model_id.startswith("gemini-2.5"):
+        return "none"
+    return None
+
+
 class _Transient(Exception):
     """Internal marker for a retryable failure."""
 
@@ -253,12 +275,8 @@ def _call(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    # reasoning_effort caps how much a model "thinks" before answering. gpt-oss
-    # reasons by default; Gemini 2.5 *thinks* by default and those tokens eat the
-    # output budget, TRUNCATING the JSON — so we pass "none" to turn thinking off
-    # and get the answer directly. Other providers use a different knob, so it's
-    # dropped for them rather than erroring.
-    if reasoning_effort and ("gpt-oss" in model_id or model_id.startswith("gemini-2.5")):
+    # Already resolved per model by _effort_for (None = the model has no knob).
+    if reasoning_effort:
         body["reasoning_effort"] = reasoning_effort
 
     resp = requests.post(

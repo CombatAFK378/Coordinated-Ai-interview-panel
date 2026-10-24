@@ -44,10 +44,14 @@ class PanelVoiceAgent(Agent):
 
 class LiveKitSession:
     def __init__(self, settings, room: str, identity: str, *, recruiter=False,
-                 on_event=None):
+                 phone=False, on_event=None):
         self.settings = settings
         self.room_name = room
         self.identity = identity
+        # A phone (SIP) caller: its identity isn't known up front, so the session
+        # links to whichever SIP participant is in the room, and its audio is
+        # narrowband telephony.
+        self.phone = phone
         # Barge-in policy differs by surface:
         #  - Interview: follows settings.allow_bargein. On speakers, echo/noise
         #    falsely triggers barge-in and chops interviewers off mid-word (Liam's
@@ -59,6 +63,7 @@ class LiveKitSession:
         self.on_event = on_event or (lambda event: None)
         self.on_text = None
         self._on_joined = None
+        self._on_left = None
         self._joined = False
         self._partial = ""
         self._loop = None
@@ -77,6 +82,16 @@ class LiveKitSession:
 
     def set_on_user_joined(self, callback):
         self._on_joined = callback
+
+    def set_on_user_left(self, callback):
+        """Called (on the voice loop thread) when the joined user leaves — for a
+        phone caller, when they hang up."""
+        self._on_left = callback
+
+    def _is_user(self, participant) -> bool:
+        if self.phone:
+            return participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+        return participant.identity == self.identity
 
     def start(self):
         self._thread.start()
@@ -158,20 +173,30 @@ class LiveKitSession:
 
         @self._room.on("track_subscribed")
         def subscribed(track, publication, participant):
-            if (participant.identity == self.identity and track.kind == rtc.TrackKind.KIND_AUDIO
+            if (self._is_user(participant) and track.kind == rtc.TrackKind.KIND_AUDIO
                     and not self._joined):
                 self._joined = True
                 if self._on_joined:
                     self._on_joined(participant.identity)
 
+        @self._room.on("participant_disconnected")
+        def left(participant):
+            if self._joined and self._is_user(participant) and self._on_left:
+                self._on_left(participant.identity)
+
         token = build_room_token(self.settings, self.room_name, "panel", agent=True)
         await self._room.connect(self.settings.livekit_url, token)
         filters = {"bvc": noise_cancellation.BVC, "nc": noise_cancellation.NC}
+        if self.phone:   # BVC's telephony model is tuned for narrowband call audio
+            filters = {"bvc": noise_cancellation.BVCTelephony,
+                       "nc": noise_cancellation.BVCTelephony}
         make_filter = filters.get(self.settings.livekit_noise_cancellation)
+        link = ({"participant_kinds": [rtc.ParticipantKind.PARTICIPANT_KIND_SIP]}
+                if self.phone else {"participant_identity": self.identity})
         await self._voice.start(
             agent=PanelVoiceAgent(self), room=self._room,
             room_options=room_io.RoomOptions(
-                participant_identity=self.identity,
+                **link,
                 audio_input=room_io.AudioInputOptions(
                     noise_cancellation=make_filter() if make_filter else None,
                 ),

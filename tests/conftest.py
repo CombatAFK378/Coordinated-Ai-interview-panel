@@ -15,7 +15,8 @@ def settings():
     return Settings(_env_file=None, livekit_url='ws://localhost:7880',
                     livekit_api_key='test-key', livekit_api_secret='x' * 40,
                     livekit_noise_cancellation='off', deepgram_api_key='test-deepgram',
-                    groq_api_key='test-groq')
+                    groq_api_key='test-groq',
+                    phone_agent_name='')   # no phone line registering with LiveKit in tests
 
 
 @pytest.fixture

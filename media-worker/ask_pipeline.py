@@ -1,11 +1,19 @@
-"""Grounded voice Q&A with named, distinct panel voices over LiveKit."""
+"""Grounded voice Q&A with named, distinct panel voices over LiveKit.
+
+In the browser the recruiter has already opened an interview. On the phone the
+call starts with no record: Julian asks which interview, the caller names it
+("Shashank's 4:30 interview"), and the panel then answers from that record. The
+caller can switch interviews mid-call or say goodbye to hang up.
+"""
+import difflib
 import logging
 import queue
+import re
 import threading
 import time
 
 from pipeline import _is_filler
-from shared import ask_panel, prompts, store
+from shared import ask_panel, interview_lookup, prompts, store
 from shared.panel_routing import PanelRouter
 from shared.models import REC_DECLINE, REC_PROCEED, REC_PROCEED_FLAGGED
 
@@ -50,6 +58,28 @@ def _looks_like_question(t: str) -> bool:
     return any(sig in t for sig in _QUESTION_SIGNALS)
 
 
+# Phone sign-offs. Not "that's it": it also answers "is that the one?".
+_GOODBYES = ("bye", "goodbye", "hang up", "end the call", "that's all", "that is all")
+
+
+def _is_goodbye(text: str) -> bool:
+    """A short sign-off ("ok thanks, bye"), not a question that mentions one."""
+    t = text.lower().strip()
+    return (len(re.findall(r"[a-z']+", t)) <= 8 and not _looks_like_question(t)
+            and any(re.search(rf"\b{re.escape(g)}\b", t) for g in _GOODBYES))
+
+
+def _has_override_trigger(t: str) -> bool:
+    """'override' / 'overrule' / 'overwrite', tolerating typos from chat
+    ("ovveride"): misspellings score ≥ 0.88 against them, ordinary words like
+    "overdue" or "overview" ≤ 0.8."""
+    if any(w in t for w in _OVERRIDE_TRIGGERS):
+        return True
+    return any(difflib.SequenceMatcher(None, tok, w).ratio() >= 0.85
+               for tok in re.findall(r"[a-z]+", t) if len(tok) >= 6
+               for w in _OVERRIDE_TRIGGERS)
+
+
 def _detect_override(text: str):
     """Return (decision, reason) ONLY if the recruiter clearly *commanded* an
     override (decline or proceed — no other states), else None.
@@ -60,7 +90,7 @@ def _detect_override(text: str):
     t = text.lower()
     if _looks_like_question(t):
         return None
-    trig = any(w in t for w in _OVERRIDE_TRIGGERS)
+    trig = _has_override_trigger(t)
     accept = any(p in t for p in _ACCEPT_PHRASES) or (trig and any(w in t for w in _ACCEPT_WORDS))
     reject = any(p in t for p in _REJECT_PHRASES) or (trig and any(w in t for w in _REJECT_WORDS))
     # Override is binary: DECLINE or PROCEED. (No PROCEED_FLAGGED from voice —
@@ -72,10 +102,55 @@ def _detect_override(text: str):
     return None
 
 
+def apply_override(record, text: str):
+    """Deterministic override (§7) for a clear spoken or typed command. Returns
+    (Julian's reply, the Override — None if it was a no-op), or None when `text`
+    isn't an override command. Shared by voice and WhatsApp."""
+    intent = _detect_override(text)
+    if intent is None:
+        t = text.lower()
+        if _has_override_trigger(t) and not _looks_like_question(t):
+            # "override it" with no (or both) directions: ask, don't guess.
+            return ("Which way should I override it: proceed with the candidate, or "
+                    "decline? Tell me and I'll log it.", None)
+        return None
+    decision, reason = intent
+    current = (record.overrides[-1].decision if record.overrides
+               else record.report.conclusion.recommendation)
+    proceed_now = current in (REC_PROCEED, REC_PROCEED_FLAGGED)
+    # Override only flips the record to the OTHER state. If it's already there
+    # ("decline the candidate" when already declined), it's a no-op — don't
+    # announce a bogus override.
+    already = (decision == REC_DECLINE and not proceed_now) or \
+              (decision == REC_PROCEED and proceed_now)
+    if already:
+        state = "declined" if not proceed_now else "cleared to proceed"
+        logger.info("ask: override to %s ignored — already %s", decision, current)
+        return (f"The panel has already {state} this candidate, so there's nothing to "
+                f"flip. If you want to reverse that, tell me to "
+                f"{'proceed with' if not proceed_now else 'decline'} the candidate.", None)
+    ov = ask_panel.override(record, decision, reason)
+    try:                       # persist so the dashboard reflects it (§11)
+        store.save_record(record)
+    except Exception:
+        logger.exception("failed to persist override")
+    orig = ov.original_recommendation.replace("_", " ").lower()
+    new = ov.decision.replace("_", " ").lower()
+    return (f"Done. I've overridden the panel's recommendation from {orig} to {new}, "
+            "and logged that you asked for it. The panel's original call stays on "
+            "record.", ov)
+
+
 class AskPipeline:
-    def __init__(self, session, settings, record, on_event=None):
+    def __init__(self, session, settings, record, on_event=None, *, phone=False,
+                 on_hangup=None):
+        # `record` is None for a phone call until the caller names an interview.
         self.session, self.settings, self.record = session, settings, record
         self.on_event = on_event
+        self.phone = phone
+        self.on_hangup = on_hangup or (lambda: None)
+        self._candidate = ""          # loaded interview's candidate name (phone)
+        self._options: list[dict] = []   # interviews offered in a "which one?" question
         self.router = PanelRouter()
         self._stop = threading.Event()
         self._jobs = queue.Queue()
@@ -101,6 +176,11 @@ class AskPipeline:
         self._greeted = True
         def greet():
             time.sleep(1.2)
+            if self.record is None:
+                self._speak("orchestrator", "Hi, this is Julian from the interview panel. "
+                            "Which interview would you like to talk about? Tell me the "
+                            "candidate's name and roughly when it was.")
+                return
             rec = self.record.report.conclusion.recommendation.replace("_", " ").lower()
             self._speak("orchestrator", f"Welcome back. The panel concluded: {rec}. "
                         "You can ask Liam, Maya, or another interviewer directly by name, "
@@ -143,39 +223,23 @@ class AskPipeline:
     def _answer(self, text: str):
         try:
             self._emit({"type": "thinking"})
+            if self.phone and _is_goodbye(text):
+                self._speak("orchestrator", "Thanks for calling. Goodbye.")
+                time.sleep(1.0)   # let the line finish playing before hanging up
+                self.on_hangup()
+                return
+            if self.phone and (self.record is None or interview_lookup.wants_other_interview(
+                    text, self._candidate, store.list_summaries())):
+                self._find_interview(text)
+                return
             # Deterministic override (§7): a clear spoken command applies immediately,
             # never dropped to a flaky LLM tool-call.
-            ov_intent = _detect_override(text)
-            if ov_intent is not None:
-                decision, _reason = ov_intent
-                current = (self.record.overrides[-1].decision if self.record.overrides
-                           else self.record.report.conclusion.recommendation)
-                proceed_now = current in (REC_PROCEED, REC_PROCEED_FLAGGED)
-                # Override only flips the record to the OTHER state. If it's already
-                # there ("decline the candidate" when already declined), it's a no-op
-                # — don't announce a bogus override; answer the question instead.
-                already = (decision == REC_DECLINE and not proceed_now) or \
-                          (decision == REC_PROCEED and proceed_now)
-                if already:
-                    state = "declined" if not proceed_now else "cleared to proceed"
-                    logger.info("ask: override to %s ignored — already %s", decision, current)
-                    self._speak("orchestrator",
-                                f"The panel has already {state} this candidate, so there's "
-                                "nothing to flip. If you want to reverse that, tell me to "
-                                f"{'proceed with' if not proceed_now else 'decline'} the candidate.")
-                    return
-                ov = ask_panel.override(self.record, decision, _reason)
-                try:                       # persist so the dashboard reflects it (§11)
-                    store.save_record(self.record)
-                except Exception:
-                    logger.exception("failed to persist voice override")
-                self._emit({"type": "override", "override": ov.model_dump()})
-                orig = ov.original_recommendation.replace("_", " ").lower()
-                new = ov.decision.replace("_", " ").lower()
-                self._speak("orchestrator",
-                            f"Done. I've overridden the panel's recommendation from "
-                            f"{orig} to {new}, and logged that you asked for it. The "
-                            "panel's original call stays on record.")
+            overridden = apply_override(self.record, text)
+            if overridden is not None:
+                reply, ov = overridden
+                if ov is not None:
+                    self._emit({"type": "override", "override": ov.model_dump()})
+                self._speak("orchestrator", reply)
                 return
             target = self.router.resolve(text)
             logger.info("ask: routing to %s", target or "open/orchestrator")
@@ -195,6 +259,58 @@ class AskPipeline:
         finally:
             self._emit({"type": "idle"})
 
+    # ---- phone lobby: which interview? ---------------------------------------
+
+    def _find_interview(self, text: str):
+        """Resolve the interview the caller means; ask which one if it's ambiguous."""
+        now = interview_lookup.now()
+        res = interview_lookup.resolve(text, store.list_summaries(), now, self._options)
+        if res.outcome == "found":
+            self._load(res.row, now)
+        elif res.outcome == "none_saved":
+            self._speak("orchestrator", "There are no scored interviews on record yet, "
+                        "so there's nothing for the panel to discuss.")
+        elif res.outcome == "unclear":
+            self._speak("orchestrator", "Which candidate? Tell me their name, and roughly "
+                        "when the interview was.")
+        elif res.outcome == "ambiguous":
+            n = len(res.options)
+            three = "; here are three" if n > 3 else ""
+            self._offer(res.options, now, f"I have {n} interviews that could be it{three}:")
+        else:
+            latest = ", the latest three" if len(res.options) > 3 else ""
+            self._offer(res.options, now, f"I couldn't find that one. Here's what I have{latest}:")
+
+    def _offer(self, rows: list[dict], now, intro: str):
+        """Read out up to three interviews (newest/closest first) and ask which."""
+        self._options = rows[:3]
+        listing = [interview_lookup.describe(r, now) for r in self._options]
+        if len(listing) == 1:
+            self._speak("orchestrator", f"{intro} {listing[0]}. Is that the one?")
+        else:
+            self._speak("orchestrator",
+                        f"{intro} {'; '.join(listing[:-1])}; or {listing[-1]}. Which one?")
+
+    def _load(self, row: dict, now):
+        record = store.load_record(row["interview_id"])
+        if record is None:
+            self._speak("orchestrator", "I couldn't open that interview's record. "
+                        "Which other interview can I help with?")
+            return
+        self.record, self.router, self._options = record, PanelRouter(), []
+        self._candidate = row.get("candidate_name") or ""
+        logger.info("phone: loaded interview %s (%s)", record.interview_id,
+                    self._candidate or "unnamed")
+        rec = record.report.conclusion.recommendation.replace("_", " ").lower()
+        names = [prompts.AGENTS[s.agent_id].name for s in record.report.scores
+                 if s.agent_id in prompts.AGENTS]
+        if len(names) > 1:
+            on_line = f"{', '.join(names[:-1])} and {names[-1]} are on the line"
+        else:
+            on_line = f"{names[0] if names else 'The panel'} is on the line"
+        self._speak("orchestrator",
+                    f"Got it: {interview_lookup.describe(row, now)}. The panel recommended "
+                    f"{rec}. {on_line}. Ask any of them by name, or ask me.")
 
     def _speak(self, agent_id: str, text: str):
         if not self._current():

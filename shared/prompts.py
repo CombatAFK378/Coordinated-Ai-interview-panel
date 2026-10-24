@@ -480,6 +480,9 @@ _ASK_RULES = (
     "decision already made, NOT re-judging.\n"
     "- Answer ONLY from the record below. If something isn't in it, say so plainly; "
     "never invent reasoning the panel didn't have.\n"
+    "- The recruiter CAN overrule the recommendation. If they want to, never say it "
+    "can't be changed: tell them to say 'override to proceed' or 'override to "
+    "decline' and it will be logged (the locked scores themselves never change).\n"
     "- This is a LIVE call — keep it SHORT: one to two sentences, then stop. The "
     "recruiter will ask a follow-up if they want more; don't pre-empt it with a "
     "monologue. Get to the point in the first sentence.\n"
@@ -489,6 +492,22 @@ _ASK_RULES = (
     "CONCLUSION entry' or 'LOCKED SCORES'). Just say it in plain words.\n"
     "- This is SPOKEN aloud: no markdown, no asterisks, no bullet points, no "
     "underscores or ALL-CAPS labels — say 'proceed with flags', not "
+    "'PROCEED_FLAGGED'."
+)
+
+_ASK_CHAT_RULES = (
+    "\n\nThe interview is over and the scores are locked. You are {name}, replying "
+    "to a recruiter in a WhatsApp chat about this candidate — a spokesperson reading "
+    "back a decision already made, NOT re-judging.\n"
+    "- Answer ONLY from the record below. If something isn't in it, say so plainly; "
+    "never invent reasoning the panel didn't have.\n"
+    "- The recruiter CAN overrule the recommendation. If they want to, never say it "
+    "can't be changed: tell them to send 'override to proceed' or 'override to "
+    "decline' and it will be logged (the locked scores themselves never change).\n"
+    "- Keep it short for a phone screen: two to four sentences, answer first. Cite "
+    "specifics where they help — what the candidate said, the turn, the score you gave.\n"
+    "- Plain text: no headings, bullet lists or markdown, and never quote the "
+    "record's section headings or bracket tags. Say 'proceed with flags', not "
     "'PROCEED_FLAGGED'."
 )
 
@@ -503,11 +522,14 @@ _COUNTERFACTUAL_RULES = (
 )
 
 
-def build_ask_prompt(agent_id: str, record_text: str, question: str) -> list[dict]:
+def build_ask_prompt(agent_id: str, record_text: str, question: str,
+                     channel: str = "voice") -> list[dict]:
     """Grounded Q&A prompt. `agent_id` is the answering agent (an interviewer for
-    an addressed question, the Orchestrator for an open one)."""
+    an addressed question, the Orchestrator for an open one). `channel` is
+    "voice" (spoken, very short) or "chat" (WhatsApp, a little fuller)."""
     agent = AGENTS[agent_id]
-    system = agent.persona + _ASK_RULES.format(name=agent.name)
+    rules = _ASK_CHAT_RULES if channel == "chat" else _ASK_RULES
+    system = agent.persona + rules.format(name=agent.name)
     user = (f"THE LOCKED RECORD:\n{record_text}\n\n"
             f"Recruiter asks: {question}\n\nAnswer from the record only.")
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]

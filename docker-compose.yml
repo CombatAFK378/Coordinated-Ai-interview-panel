@@ -36,3 +36,15 @@ services:
     # Watch both mounted code dirs so edits to shared/ hot-reload too (default
     # --reload only watches the app dir, /app/media-worker).
     command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload --reload-dir /app/media-worker --reload-dir /app/shared
+
+  # Public HTTPS tunnel for Ask the Panel on WhatsApp: Twilio posts incoming
+  # messages to https://$NGROK_DOMAIN/whatsapp/webhook. The app serves ONLY that
+  # path through the tunnel (everything else 404s). Needs NGROK_AUTHTOKEN and
+  # NGROK_DOMAIN in .env; without them this service exits and the rest runs as normal.
+  ngrok:
+    image: ngrok/ngrok:3.39.13-alpine
+    command: http media-worker:8080 --url=https://${NGROK_DOMAIN:-} --log=stdout
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    depends_on:
+      - media-worker

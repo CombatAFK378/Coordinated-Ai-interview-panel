@@ -40,18 +40,22 @@ def _read(interview_id: str) -> dict | None:
         return None
 
 
-def save_record(record: PanelRecord, *, candidate_name: str = "", role: str = "") -> dict:
-    """Write (or update) the interview's JSON. `created_at` and the candidate
-    name/role are preserved from an existing file so re-saves (after an override
-    or counterfactual) don't lose them."""
+def save_record(record: PanelRecord, *, candidate_name: str = "", role: str = "",
+                started_at: float | None = None) -> dict:
+    """Write (or update) the interview's JSON. `created_at`, `started_at` and the
+    candidate name/role are preserved from an existing file so re-saves (after an
+    override or counterfactual) don't lose them. `started_at` is when the
+    interview began — what a caller means by "the 4:30 interview"."""
     prev = _read(record.interview_id) or {}
     created_at = prev.get("created_at", time.time())
+    started_at = started_at or prev.get("started_at")
     candidate_name = candidate_name or prev.get("candidate_name", "")
     role = role or prev.get("role", "")
     rep = record.report
     data = {
         "interview_id": record.interview_id,
         "created_at": created_at,
+        "started_at": started_at,
         "candidate_name": candidate_name,
         "role": role,
         "recommendation": rep.conclusion.recommendation,
@@ -73,7 +77,7 @@ def save_record(record: PanelRecord, *, candidate_name: str = "", role: str = ""
     return data
 
 
-_SUMMARY_KEYS = ("interview_id", "created_at", "candidate_name", "role",
+_SUMMARY_KEYS = ("interview_id", "created_at", "started_at", "candidate_name", "role",
                  "recommendation", "headline", "override")
 
 

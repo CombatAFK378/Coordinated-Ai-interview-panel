@@ -7,8 +7,8 @@ end, then debated. A recruiter can rejoin the session later and cross-examine
 any interviewer about its reasoning.
 
 This document is the implementation contract for the **LiveKit build** — the final
-end-to-end architecture: LiveKit for real-time voice, Gemini 2.5 Flash as the
-reasoning model, and Postgres + Redis as the persistence layer. It describes
+end-to-end architecture: LiveKit for real-time voice, MiniMax M3 on Ollama Cloud
+as the reasoning model, and Postgres + Redis as the persistence layer. It describes
 structure, data flow and invariants — not code.
 
 ## 0. Stack and layout
@@ -91,30 +91,32 @@ coding round. No public custom-LLM callback or tunnel is needed for voice.
 
 | Job | Frequency | Latency | Model |
 |---|---|---|---|
-| Bids + claim extraction | every turn, ×5 parallel | critical | `groq:openai/gpt-oss-120b` |
-| Question generation | every turn | critical | `groq:openai/gpt-oss-120b` |
+| Bids + claim extraction | every turn, ×5 parallel | critical | `ollama:gpt-oss:120b` |
+| Question generation | every turn | critical | `ollama:gpt-oss:120b` |
 | Audio endpointing | each speech pause | critical | LiveKit `v1-mini` (local CPU) |
 | Coding round (screen-watch) | live, coding round | streaming | Gemini Live (`gemini-3.1-flash-live-preview`) |
-| Final scoring | once, ×5 | none | `gemini:gemini-2.5-flash` |
-| Debate statements | once, ×5 | none | Gemini 2.5 Flash |
-| Orchestrator conclusion | once | none | Gemini 2.5 Flash |
-| Dossier / panel composition | once, at creation | none | Gemini 2.5 Flash |
-| Ask the Panel replies | on demand | ~1s | `groq:openai/gpt-oss-120b` |
-| Counterfactual re-score | on demand | ~2s | Gemini 2.5 Flash |
+| Final scoring | once, ×5 | none | `ollama:minimax-m3` |
+| Debate statements | once, ×5 | none | MiniMax M3 |
+| Orchestrator conclusion | once | none | MiniMax M3 |
+| Dossier / panel composition | once, at creation | none | MiniMax M3 |
+| Ask the Panel replies | on demand | ~1–2s | `ollama:gpt-oss:120b` |
+| Counterfactual re-score | on demand | ~2–4s | MiniMax M3 |
 
 Rule: **fast model where the candidate is waiting, deep model where the decision
-is made.** The fast path is Groq's `gpt-oss-120b` (sub-second); scoring, debate,
-conclusion and dossier use **Gemini 2.5 Flash** (via Google's OpenAI-compatible
-endpoint), where latency doesn't matter because the candidate has left. Gemini is
-called with thinking disabled so it emits the JSON directly instead of spending the
-budget on chain-of-thought.
+is made.** Both run on **Ollama Cloud** (Pro plan). The fast path is
+`gpt-oss-120b` (~1s per question, ~2s per five-way parallel bid round); scoring,
+debate, conclusion and dossier use **MiniMax M3**, where latency doesn't matter
+because the candidate has left. Thinking models (MiniMax, Gemini 2.5) are called
+with thinking disabled so they emit the JSON directly instead of spending the
+budget on chain-of-thought; gpt-oss always reasons, so it runs at `low` effort.
 
 Every LLM call goes through one router module (`shared/llm_router.py`) with a
-cross-provider fallback chain. The fast path round-robins across a pool of Groq
-keys to spread the per-account rate limit. If Gemini hits its free-tier cap the
-reasoning path falls back to `groq:openai/gpt-oss-120b`, and the UI shows a badge
-naming the active model. Model IDs carry a provider prefix (`gemini:` / `groq:` /
-`openrouter:`); never hardcode a single ID at a call site.
+cross-provider fallback chain. The fast path falls back to `gpt-oss-120b` on a
+round-robin pool of Groq keys (spreading the free per-account rate limit), then
+Gemini 2.5 Flash. The reasoning path falls back to Gemini 2.5 Flash, then the Groq
+pool, and the UI shows a badge naming the active model. Model IDs carry a provider
+prefix (`ollama:` / `gemini:` / `groq:` / `openrouter:`); never hardcode a single
+ID at a call site.
 
 ### The Orchestrator is a service, not a single model
 
@@ -129,8 +131,8 @@ claim.
 | Tie-breaking, recency penalties | code |
 | Choosing who speaks | code |
 | Writing audit events | code |
-| Reading the debate, writing the conclusion | Gemini 2.5 Flash |
-| Answering in Ask the Panel | gpt-oss; Gemini 2.5 Flash for counterfactuals |
+| Reading the debate, writing the conclusion | MiniMax M3 |
+| Answering in Ask the Panel | gpt-oss; MiniMax M3 for counterfactuals |
 
 Turn-taking being deterministic is the point: we can show the exact five numbers
 behind every floor grant and the formula that picked the winner. An LLM router
@@ -347,8 +349,8 @@ and it is deliberate.
 ## 6. Scoring, locking, debate
 
 Everything in this section runs on the reasoning model —
-`gemini:gemini-2.5-flash`, referenced in code as `LLM_REASONING_MODEL`, with a
-`groq:openai/gpt-oss-120b` fallback if Gemini is capped. Nothing here is
+`ollama:minimax-m3`, referenced in code as `LLM_REASONING_MODEL`, with Gemini 2.5
+Flash and then `groq:openai/gpt-oss-120b` as fallbacks. Nothing here is
 latency-sensitive; the candidate has left. Use the deepest reasoning model
 available and let it take its time.
 
@@ -405,7 +407,7 @@ early.
 
 ### Conclusion
 
-One final call, on Gemini 2.5 Flash. Input: all five locked scores, all
+One final call, on MiniMax M3. Input: all five locked scores, all
 statements, who held and who moved, and the coverage map. Output:
 
 - recommendation (`PROCEED | PROCEED_FLAGGED | INSUFFICIENT_SIGNAL | DECLINE`)
@@ -446,6 +448,36 @@ Scores, claims and conclusions remain locked. An absent interviewer explicitly
 says they did not assess the candidate. Spoken override commands are audited and
 persisted separately; questions about rejecting someone do not create overrides.
 
+### By phone
+
+A recruiter can also call the panel's number (a LiveKit Cloud phone number). A
+dispatch rule puts each call in a fresh `call-…` room and dispatches agent
+`panel-phone`; the worker registers under that name at startup (in-process,
+thread jobs) and joins the room with the same panel voice session, using BVC's
+telephony model. The call starts with no record: Julian asks which interview, the
+fast model parses the request into hints (name, time, day), and **deterministic
+code** matches them against saved interviews — fuzzy first-name match, start time
+within an hour, newest first — asking "which one?" when several fit. Then the call
+is ordinary Ask the Panel over that locked record; the caller can switch
+interviews or say goodbye to hang up. One call at a time, never during a live
+interview.
+
+### On WhatsApp
+
+The same panel in a chat (Twilio WhatsApp; the sandbox for the demo). Twilio posts
+each message to `/whatsapp/webhook` through an ngrok tunnel; the app verifies
+Twilio's signature, checks the allow-list, returns at once and answers from a worker
+thread via Twilio's REST API. Only that path is served through the tunnel.
+
+Each recruiter number is a chat with saved state (loaded interview, sticky
+addressee, last offered list). Julian hosts until an interview is picked — the
+same deterministic resolver as the phone line, plus a numbered list — then answers
+come from `ask_panel.answer(..., channel="chat")`: the same grounding guardrail,
+two to four plain sentences, each reply headed with the speaker's name because
+every message comes from one number. Overrides use the same deterministic
+detector as voice. Chat only reads saved records, so it runs alongside any voice
+session.
+
 ### Question routing
 
 Three modes:
@@ -472,7 +504,7 @@ fast model handles it.
 | "Why did you recommend X?" | gpt-oss | ~1 s |
 | "What did he say at 11:20?" | gpt-oss | ~1 s |
 | "What was Product's objection?" | gpt-oss | ~1 s |
-| "If he had said X, would that change?" | Gemini 2.5 Flash | ~2–3 s |
+| "If he had said X, would that change?" | MiniMax M3 | ~2–4 s |
 
 gpt-oss is a **spokesperson, not a judge**. It reads out a decision that was made
 and recorded hours earlier.
@@ -521,7 +553,7 @@ One interview = one LiveKit room + one media worker process + one row set.
 
 ## 9. JD and resume ingestion
 
-Parsed **once**, at interview creation, on Gemini 2.5 Flash. Never per turn.
+Parsed **once**, at interview creation, on MiniMax M3. Never per turn.
 
 ```
 JD + resume → dossier
@@ -534,7 +566,7 @@ JD + resume → dossier
 Panel composition is dynamic: a backend/ML role seats Hiring Manager, Technical
 and Coding but drops Customer and Product; a support role does the opposite.
 Getting this right is a quality signal — a weak model over-seats everyone, so
-panel selection is one reason the reasoning model is Gemini 2.5 Flash.
+panel selection is one reason the reasoning model is MiniMax M3.
 
 The pre-registered resume claims are the quiet win. When the candidate says
 something that supports or contradicts a resume claim, the ledger links them
@@ -547,8 +579,8 @@ said" without any extra machinery.
 
 | Failure | Response |
 |---|---|
-| Reasoning model capped/down | Fallback chain (Gemini 2.5 Flash → gpt-oss); UI badge shows the active model |
-| LLM 429 | Fallback chain; shared Redis token bucket; exponential backoff |
+| Reasoning model capped/down | Fallback chain (MiniMax M3 → Gemini 2.5 Flash → gpt-oss); UI badge shows the active model |
+| LLM 429 (incl. Ollama "too many concurrent requests") | Fallback chain; shared Redis token bucket; exponential backoff |
 | LLM slow (>2s) | Emit a short filler line in the agent's voice, keep waiting |
 | Model returns no JSON | Router treats "thought without answering" as failure, tries the next model |
 | Free model delisted | Router falls through to next ID; alert on fallback rate |
@@ -634,12 +666,14 @@ LIVEKIT_ENDPOINTING_MAX_DELAY 4.0
 ALLOW_BARGEIN              false                     # interview finishes turns; recruiter always interruptible
 
 # Models
-LLM_FAST_MODEL            groq:openai/gpt-oss-120b
-LLM_REASONING_MODEL       gemini:gemini-2.5-flash
-LLM_REASONING_FALLBACKS   groq:openai/gpt-oss-120b,gemini:gemini-2.0-flash
-GEMINI_API_KEY                                       # reasoning (Gemini 2.5 Flash) + Gemini Live coding
+OLLAMA_API_KEY                                      # primary: fast path + reasoning (Ollama Cloud)
+LLM_FAST_MODEL            ollama:gpt-oss:120b
+LLM_FALLBACK_CHAIN        groq:openai/gpt-oss-120b,gemini:gemini-2.5-flash
+LLM_REASONING_MODEL       ollama:minimax-m3
+LLM_REASONING_FALLBACKS   gemini:gemini-2.5-flash,groq:openai/gpt-oss-120b
+GEMINI_API_KEY                                       # fallback (Gemini 2.5 Flash) + Gemini Live coding
 GEMINI_LIVE_MODEL         gemini-3.1-flash-live-preview
-GROQ_API_KEY / GROQ_API_KEYS                        # fast path (pool round-robins the rate limit)
+GROQ_API_KEY / GROQ_API_KEYS                        # fallback (pool round-robins the rate limit)
 OPENROUTER_API_KEY                                  # vision + optional fallback models
 
 # Storage

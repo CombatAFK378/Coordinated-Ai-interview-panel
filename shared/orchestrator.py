@@ -190,11 +190,12 @@ def _one_bid(agent_id: str, transcript: list[TranscriptTurn], context: str = "")
     messages = prompts.build_bid_prompt(agent_id, transcript, context)
     for attempt in range(2):   # malformed JSON → retry once, then default (§10)
         try:
-            # gpt-oss spends completion tokens on reasoning before the JSON; the
-            # JSON now also carries claims, so give a bit more headroom — still
-            # modest to stay under the tokens-per-minute cap.
+            # gpt-oss spends completion tokens on reasoning before the JSON, and
+            # the JSON also carries claims. On Ollama "low" effort reasons longer
+            # than on Groq: 280 truncated ~1 bid in 20, 600 none (it's a ceiling,
+            # so no added latency).
             raw = llm_router.chat(
-                messages, max_tokens=280, temperature=0.3, reasoning_effort="low"
+                messages, max_tokens=600, temperature=0.3, reasoning_effort="low"
             )
             interest, reason, claims, contradicts = _parse_bid(raw)
             return Bid(agent_id, interest, reason, claims, contradicts)

@@ -11,7 +11,8 @@ import threading
 from contextlib import asynccontextmanager
 from functools import wraps
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -24,6 +25,8 @@ from shared import ask_panel, dossier as dossier_mod, gemini, prompts, scoring, 
 from livekit_session import LiveKitSession
 from pipeline import InterviewPipeline
 from ask_pipeline import AskPipeline
+from phone_line import PhoneLine
+from whatsapp import WhatsAppChats, valid_signature
 
 _LOG_FMT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=_LOG_FMT)
@@ -93,12 +96,53 @@ def serialized(fn):
 
 @asynccontextmanager
 async def lifespan(app):
+    global _phone_line, _whatsapp
     _broker.bind_loop(asyncio.get_running_loop())
+    s = get_settings()
+    if s.phone_agent_name and s.livekit_url and s.livekit_api_key and s.livekit_api_secret:
+        _phone_line = PhoneLine(s, _on_phone_call)
+        _phone_line.start()
+    if s.whatsapp_enabled:
+        _whatsapp = WhatsAppChats(s)
+        _whatsapp.start()
     yield
     await asyncio.to_thread(_teardown)
+    if _phone_line is not None:
+        await asyncio.to_thread(_phone_line.stop)
+    if _whatsapp is not None:
+        await asyncio.to_thread(_whatsapp.stop)
+
+
+class TunnelGuard:
+    """Only the WhatsApp webhook is public. Anything else that arrives through the
+    ngrok tunnel — the dashboard, candidate records, the events socket — gets a
+    404, so exposing the webhook never exposes the app."""
+    PUBLIC = {"/whatsapp/webhook"}
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] in ("http", "websocket") and scope["path"] not in self.PUBLIC
+                and self._via_tunnel(scope)):
+            if scope["type"] == "http":
+                await Response("Not found", status_code=404)(scope, receive, send)
+            else:
+                await send({"type": "websocket.close", "code": 1008})
+            return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _via_tunnel(scope) -> bool:
+        # ngrok adds X-Forwarded-For; local browser requests never carry it.
+        headers = dict(scope.get("headers") or [])
+        host = headers.get(b"host", b"").decode().split(":")[0]
+        domain = get_settings().ngrok_domain
+        return b"x-forwarded-for" in headers or bool(domain and host == domain)
 
 
 app = FastAPI(title="968ms LiveKit media worker", lifespan=lifespan)
+app.add_middleware(TunnelGuard)
 
 # Held for the lifetime of the single active session.
 _session: LiveKitSession | None = None
@@ -107,6 +151,10 @@ _ask_pipeline: AskPipeline | None = None   # voice Ask the Panel (Phase 6)
 _report: InterviewReport | None = None   # last locked report (Phase 5)
 _panel_record: ask_panel.PanelRecord | None = None   # for Ask the Panel (Phase 6)
 _dossier: Dossier | None = None          # active interview's dossier (Phase 7)
+_started_at: float | None = None         # when the active interview began
+_phone_line: PhoneLine | None = None     # Ask the Panel by phone
+_phone_done: threading.Event | None = None   # set when the active phone call ends
+_whatsapp: WhatsAppChats | None = None   # Ask the Panel on WhatsApp
 
 
 class StartRequest(BaseModel):
@@ -264,8 +312,9 @@ def _voice_settings():
         "LIVEKIT_API_SECRET": settings.livekit_api_secret,
         "DEEPGRAM_API_KEY": settings.deepgram_api_key,
     }.items() if not value]
-    if not (settings.groq_keys or settings.openrouter_api_key or settings.gemini_api_key):
-        missing.append("an LLM provider key (Groq, OpenRouter, or Gemini)")
+    if not (settings.ollama_api_key or settings.groq_keys
+            or settings.openrouter_api_key or settings.gemini_api_key):
+        missing.append("an LLM provider key (Ollama, Groq, OpenRouter, or Gemini)")
     if missing:
         raise HTTPException(503, f"Missing config: {', '.join(missing)}")
     return settings
@@ -294,7 +343,7 @@ def _join_response(settings, room, identity, panel):
 @app.post("/session/start", response_model=SessionStartResponse)
 @serialized
 def session_start(req: StartRequest | None = None):
-    global _session, _pipeline, _report, _panel_record, _dossier
+    global _session, _pipeline, _report, _panel_record, _dossier, _started_at
     settings = _voice_settings()
     req = req or StartRequest()
     # Parse before replacing the active session, so a dossier error is recoverable.
@@ -303,6 +352,7 @@ def session_start(req: StartRequest | None = None):
     _teardown()
     _report = _panel_record = None
     _dossier = dossier
+    _started_at = time.time()
     interview_id = uuid.uuid4().hex[:12]
     _begin_session_logs(interview_id)
     room = f"iv-{interview_id}"
@@ -447,6 +497,7 @@ def session_conclude():
             _panel_record,
             candidate_name=(_dossier.candidate_name if _dossier else ""),
             role=(_dossier.role if _dossier else ""),
+            started_at=_started_at,
         )
     except Exception:
         logger.exception("failed to persist interview %s", _pipeline.interview_id)
@@ -561,8 +612,85 @@ def session_stop():
     return {"status": "stopped"}
 
 
+# ---- Ask the Panel on WhatsApp --------------------------------------------
+
+_EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    """Twilio's "a message came in" callback. Verifies Twilio's signature, then
+    queues the message and returns at once; replies go out via Twilio's API."""
+    settings = get_settings()
+    if _whatsapp is None:
+        raise HTTPException(503, "WhatsApp is not configured")
+    params = {k: str(v) for k, v in (await request.form()).items()}
+    # Twilio signs the public URL it called — rebuild it as seen through the tunnel.
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    url = f"{proto}://{host}{request.url.path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    if not valid_signature(settings.twilio_auth_token, url, params,
+                           request.headers.get("x-twilio-signature")):
+        logger.warning("whatsapp: rejected a request with a bad Twilio signature")
+        raise HTTPException(403, "invalid signature")
+    sender = params.get("From", "")
+    if not settings.whatsapp_allows(sender):
+        logger.warning("whatsapp: ignoring message from %s (not allowed)", sender)
+    elif params.get("Body", "").strip():
+        _whatsapp.submit(sender, params["Body"])
+    return Response(_EMPTY_TWIML, media_type="text/xml")
+
+
+# ---- Ask the Panel by phone ----------------------------------------------
+
+def _on_phone_call(room: str) -> threading.Event | None:
+    """A call to the panel's number (PhoneLine). It becomes the active voice
+    session and starts in Julian's lobby: the caller names an interview, then the
+    panel answers from that locked record. Never cuts into a live interview.
+    Returns an Event set when the call ends, or None to refuse it."""
+    global _session, _ask_pipeline, _phone_done
+    with _lifecycle_lock:
+        if _pipeline is not None:
+            logger.warning("phone: interview %s is live; refusing call in %s",
+                           _pipeline.interview_id, room)
+            return None
+        if _phone_done is not None:
+            logger.warning("phone: already on a call; refusing call in %s", room)
+            return None
+        try:
+            settings = _voice_settings()
+        except HTTPException as e:
+            logger.error("phone: cannot take call: %s", e.detail)
+            return None
+        _teardown()
+        _begin_session_logs(room)
+        session = LiveKitSession(settings, room, "caller", recruiter=True, phone=True)
+        pipeline = AskPipeline(session, settings, None, phone=True,
+                               on_hangup=lambda: _end_phone_call(session))
+        session.set_on_user_left(lambda _identity: _end_phone_call(session))
+        try:
+            _start_voice(session, pipeline, pipeline.on_recruiter_joined)
+        except HTTPException:
+            return None
+        _session, _ask_pipeline, _phone_done = session, pipeline, threading.Event()
+        logger.info("phone: call in %s connected to the panel", room)
+        return _phone_done
+
+
+def _end_phone_call(session):
+    """The caller hung up or said goodbye. Runs on its own thread: it's triggered
+    from the voice or panel thread, both of which teardown joins."""
+    def end():
+        with _lifecycle_lock:
+            if _session is session:
+                _teardown()
+    threading.Thread(target=end, daemon=True, name="phone-hangup").start()
+
+
 def _teardown():
-    global _session, _pipeline, _ask_pipeline
+    global _session, _pipeline, _ask_pipeline, _phone_done
     if _session is not None:
         try:
             _session.interrupt()
@@ -577,6 +705,9 @@ def _teardown():
     if _session is not None:
         _session.stop()
         _session = None
+    if _phone_done is not None:   # lets the phone job hang up the call
+        _phone_done.set()
+        _phone_done = None
 
 
 # Serve the built React app (dist/) at "/". Mounted LAST so the API routes and

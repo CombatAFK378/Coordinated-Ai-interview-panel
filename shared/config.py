@@ -21,10 +21,31 @@ class Settings(BaseSettings):
     livekit_endpointing_max_delay: float = Field(default=4.0, gt=0)
     deepgram_api_key: str = ""
 
+    # Ask the Panel by phone. A LiveKit dispatch rule (media-worker/phone_setup.py)
+    # sends calls to the panel's number to an agent of this name; the worker
+    # registers under it at startup. Empty disables the phone line.
+    phone_agent_name: str = "panel-phone"
+    # Time zone the caller speaks in ("Shashank's 4:30 interview"), used to match
+    # and read out interview times.
+    local_timezone: str = "Asia/Kolkata"
+
+    # Ask the Panel on WhatsApp, through Twilio (the sandbox for the demo). Twilio
+    # reaches /whatsapp/webhook through the ngrok tunnel at ngrok_domain; nothing
+    # else is served there. All three Twilio values are needed to enable it.
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_whatsapp_from: str = ""            # e.g. whatsapp:+14155238886 (the sandbox)
+    # Comma-separated numbers allowed to chat (+91…); empty = anyone who joined.
+    whatsapp_allowed_numbers: str = ""
+    ngrok_domain: str = ""
+
     # LLM. Every model call goes through the shared router in
     # shared/llm_router.py; never hardcode a model at a call site. Model ids may
-    # carry a provider prefix ("groq:" / "openrouter:"); unprefixed ids default
-    # to OpenRouter. Both providers are OpenAI-compatible.
+    # carry a provider prefix ("ollama:" / "groq:" / "gemini:" / "openrouter:");
+    # unprefixed ids default to OpenRouter. All providers are OpenAI-compatible.
+    # Ollama Cloud (Pro plan) is the primary for both the fast path and the
+    # reasoning model; Groq and Gemini are the fallbacks.
+    ollama_api_key: str = ""
     openrouter_api_key: str = ""
     groq_api_key: str = ""
     # Optional pool of Groq keys (comma-separated) from separate accounts. The
@@ -32,17 +53,21 @@ class Settings(BaseSettings):
     # is shared out — same model/quality, ~N× the free budget. Falls back to the
     # single groq_api_key if unset.
     groq_api_keys: str = ""
-    llm_fast_model: str = "groq:openai/gpt-oss-120b"      # candidate is waiting
-    # Reasoning model (scoring, debate, conclusion, dossier). Gemini 2.5 Flash via
-    # Google's OpenAI-compatible endpoint: reliable, fast (~8s), strong instruction
-    # following (correct panel composition), generous free tier. The OpenRouter
-    # free reasoning tiers (MiniMax delisted, Nemotron overloaded, Laguna 429) are
-    # no longer dependable, so they're gone.
-    llm_reasoning_model: str = "gemini:gemini-2.5-flash"
-    # Two fallbacks if the primary is momentarily down: gpt-oss (Groq pool, very
-    # reliable) then a second Gemini tier. Comma-separated.
-    llm_reasoning_fallbacks: str = "groq:openai/gpt-oss-120b,gemini:gemini-2.0-flash"
-    llm_fallback_chain: str = ""                          # comma-separated ids
+    # Fast path (candidate is waiting): gpt-oss-120b on Ollama Cloud — no free-tier
+    # tokens-per-minute cap, so no key pool needed. Falls back to the same model on
+    # the Groq pool, then Gemini.
+    llm_fast_model: str = "ollama:gpt-oss:120b"
+    # Reasoning model (scoring, debate, conclusion, dossier): MiniMax M3 on Ollama
+    # Cloud, called with thinking off. Benchmarked on the real prompts (Oct 2026):
+    # clean JSON every run in ~2-10s and correct panel composition. GLM 5.3 /
+    # 5.3-flash leak reasoning into the answer even with thinking off and blow
+    # the token budget, so they're not used.
+    llm_reasoning_model: str = "ollama:minimax-m3"
+    # Fallbacks if the primary is down: Gemini 2.5 Flash, then gpt-oss (Groq pool).
+    # Comma-separated.
+    llm_reasoning_fallbacks: str = "gemini:gemini-2.5-flash,groq:openai/gpt-oss-120b"
+    # Fast-path fallbacks, tried in order after llm_fast_model. Comma-separated.
+    llm_fallback_chain: str = "groq:openai/gpt-oss-120b,gemini:gemini-2.5-flash"
     # Coding round (§8) vision models — gpt-oss is text-only, so these must be
     # image-capable. Two tiers: a FAST one for live screen reads mid-interview, and
     # a bigger one for the scoring pass at conclude (latency-insensitive). Both
@@ -117,6 +142,16 @@ class Settings(BaseSettings):
     def vision_fallbacks(self) -> list[str]:
         """Extra vision models tried (in order) if the primary vision model fails."""
         return [m.strip() for m in self.llm_vision_fallbacks.split(",") if m.strip()]
+
+    @property
+    def whatsapp_enabled(self) -> bool:
+        return bool(self.twilio_account_sid and self.twilio_auth_token
+                    and self.twilio_whatsapp_from)
+
+    def whatsapp_allows(self, sender: str) -> bool:
+        """Is this sender ("whatsapp:+91…") allowed to chat with the panel?"""
+        allowed = {n.strip() for n in self.whatsapp_allowed_numbers.split(",") if n.strip()}
+        return not allowed or sender.removeprefix("whatsapp:").strip() in allowed
 
     @property
     def groq_keys(self) -> list[str]:

@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from ask_pipeline import AskPipeline, _detect_override
+from ask_pipeline import AskPipeline, _detect_override, apply_override
 from livekit_session import SpokenTurn
 from pipeline import InterviewPipeline
 from shared import ask_panel, prompts
@@ -41,6 +41,23 @@ def test_followups_and_reset():
                                  'override', 'override accept and reject'])
 def test_questions_and_ambiguous_commands_do_not_override(text):
     assert _detect_override(text) is None
+
+
+@pytest.mark.parametrize('text,decision', [
+    ('No worries i want you to ovveride the decesion with proceed', 'PROCEED'),
+    ('overide it and decline', 'DECLINE'),
+    ('overrule the panel and hire him', 'PROCEED'),
+    ('the overdue report should proceed', None),       # not an override word
+])
+def test_override_tolerates_typos(text, decision):
+    result = _detect_override(text)
+    assert (result[0] if result else None) == decision
+
+
+def test_bare_override_asks_which_way(record):
+    reply, ov = apply_override(record, 'please ovveride it')
+    assert ov is None and reply.startswith('Which way should I override it')
+    assert apply_override(record, 'what was the overview?') is None
 
 
 def test_named_answer_uses_that_personas_voice(settings, record, monkeypatch):

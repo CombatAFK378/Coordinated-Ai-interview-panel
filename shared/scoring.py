@@ -29,7 +29,7 @@ _JSON = re.compile(r"\{.*\}", re.DOTALL)
 _VALID_RECS = {REC_PROCEED, REC_PROCEED_FLAGGED, REC_INSUFFICIENT, REC_DECLINE}
 
 # Which reasoning model is actually serving right now — so the UI can show when
-# the primary (Gemini) hits its free-tier cap and we fall back to Groq. A single
+# the primary (MiniMax on Ollama) fails and we fall back to Gemini or Groq. A single
 # notifier (registered by the worker) is called ONLY on a transition, not per call.
 _reasoning_notifier = None
 _reasoning_serving: dict = {"model": None}
@@ -44,12 +44,15 @@ def set_reasoning_notifier(fn):
 
 def _friendly_model(model_id: str) -> str:
     """'gemini:gemini-2.5-flash' -> 'Gemini 2.5 Flash'; 'groq:openai/gpt-oss-120b'
-    -> 'Groq (gpt-oss-120b)'. Best-effort, for the UI badge."""
+    -> 'Groq (gpt-oss-120b)'; 'ollama:minimax-m3' -> 'Ollama (minimax-m3)'.
+    Best-effort, for the UI badge."""
     bare = model_id.split(":", 1)[-1]
     if "gemini" in model_id:
         return "Gemini " + bare.replace("gemini-", "").replace("-", " ").title()
     if model_id.startswith("groq:"):
         return f"Groq ({bare.split('/')[-1]})"
+    if model_id.startswith("ollama:"):
+        return f"Ollama ({bare})"
     return bare.split("/")[-1]
 
 
@@ -74,8 +77,8 @@ def _note_serving(model_id: str, primary: str):
 
 
 def reason(messages: list[dict], max_tokens: int = 600) -> str:
-    """Call the reasoning model, walking the configured fallbacks and finally
-    gpt-oss (reliable clean JSON via the Groq pool, since its chain-of-thought
+    """Call the reasoning model, walking the configured fallbacks (Gemini, then
+    gpt-oss — reliable clean JSON via the Groq pool, since its chain-of-thought
     goes to a separate channel).
 
     Every caller parses JSON out of the result, so this is JSON-AWARE: a 200-OK
@@ -90,15 +93,15 @@ def reason(messages: list[dict], max_tokens: int = 600) -> str:
     for model_id in chain:
         kwargs = dict(temperature=0.4, max_tokens=max_tokens, timeout=60,
                       use_fallback_chain=False)
-        if model_id.startswith("groq:"):
+        if "gpt-oss" in model_id:
             # gpt-oss: low reasoning effort so it emits JSON instead of thinking the
             # budget away, with retries to ride out empty-content blips.
             kwargs.update(retries=2, reasoning_effort="low")
-        elif model_id.startswith("gemini:"):
-            # Gemini 2.5 thinks by default and truncates the JSON — turn it off.
-            kwargs.update(retries=1, reasoning_effort="none")
         else:
-            kwargs.update(retries=1)   # one retry for a transient blip, then move on
+            # Gemini 2.5 and MiniMax think by default and truncate the JSON — turn
+            # it off (the router drops it for models without the knob). One retry
+            # for a transient blip, then move on.
+            kwargs.update(retries=1, reasoning_effort="none")
         try:
             raw = llm_router.chat(messages, model=model_id, **kwargs)
             last_raw = raw

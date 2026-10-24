@@ -18,6 +18,47 @@ with six persona-specific speech plugins and separate grounded LLM contexts.
 The application controls who holds the floor; this design supports each voice
 without six simultaneous listeners or agents answering over one another.
 
+### By phone
+
+Call the panel's number and Julian answers: *"Which interview would you like to
+talk about?"* Say something like **"Shashank's 4:30 interview"** — the fast model
+parses the name and time, and plain code matches them against saved interviews
+(asking "which one?" if several fit). Then ask the panel as above, each
+interviewer in their own voice. Say "now let's talk about Priya's interview" to
+switch, or "that's all, bye" to hang up.
+
+Setup: rent a number in LiveKit Cloud (**Telephony → Phone numbers**; every plan
+includes one free US number, inbound only), then create its dispatch rule once:
+
+```bash
+docker compose run --rm media-worker python phone_setup.py +14155550123
+```
+
+The worker registers as agent `panel-phone` at startup — no tunnel or public URL
+needed. One call at a time; a call is refused while a candidate interview is live.
+
+### On WhatsApp
+
+Message the panel and Julian hosts: say *hi* for a numbered list of interviews,
+reply with a number (or a name and time), then ask anyone by name — "Liam, why that
+coding score?". Each reply is headed with who is speaking (`*Liam · Coding
+Interviewer*`), follow-ups stay with them, *menu* switches interviews, and "proceed
+with / decline the candidate" logs an override like the voice panel does.
+
+Setup (Twilio WhatsApp Sandbox + an ngrok tunnel, both free):
+
+1. In Twilio's console, **Messaging → Try it out → Send a WhatsApp message**, and
+   send the `join <code>` message it shows from each phone that will chat (the
+   sandbox needs a re-join every 3 days).
+2. Add to `.env`: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM`
+   (`whatsapp:` + the sandbox number), `WHATSAPP_ALLOWED_NUMBERS`, and from
+   ngrok's dashboard `NGROK_AUTHTOKEN` and your free `NGROK_DOMAIN`.
+3. `docker compose up` also starts the tunnel. In the sandbox settings set **When a
+   message comes in** to `https://<NGROK_DOMAIN>/whatsapp/webhook` (POST).
+
+Only that webhook is reachable through the tunnel — everything else answers 404 —
+and every request must carry a valid Twilio signature.
+
 ## Voice stack
 
 ```
@@ -45,8 +86,8 @@ microphone → LiveKit room → BVC → Silero + Deepgram streaming STT
    your `.env` and add the new LiveKit fields; do not overwrite provider keys.
 2. Set `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` from your
    [LiveKit Cloud project](https://cloud.livekit.io/). Keep `DEEPGRAM_API_KEY` for
-   both streaming STT and TTS. Keep keys for the LLM providers configured in your
-   model settings (Groq, Gemini and/or OpenRouter).
+   both streaming STT and TTS. Set `OLLAMA_API_KEY` (Ollama Cloud runs both the
+   interviewers and the orchestrator) and keep Groq and Gemini keys as fallbacks.
 3. Run `docker compose up --build`. Open [localhost:8080](http://localhost:8080),
    allow microphone and camera, and join an interview. Both local voice models
    are bundled and checked during the image build; no model download is needed.
