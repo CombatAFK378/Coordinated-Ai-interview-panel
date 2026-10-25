@@ -41,16 +41,18 @@ def _read(interview_id: str) -> dict | None:
 
 
 def save_record(record: PanelRecord, *, candidate_name: str = "", role: str = "",
-                started_at: float | None = None) -> dict:
-    """Write (or update) the interview's JSON. `created_at`, `started_at` and the
-    candidate name/role are preserved from an existing file so re-saves (after an
-    override or counterfactual) don't lose them. `started_at` is when the
-    interview began — what a caller means by "the 4:30 interview"."""
+                started_at: float | None = None, candidate_phone: str = "") -> dict:
+    """Write (or update) the interview's JSON. `created_at`, `started_at`, the
+    candidate's name/role/phone and any feedback sent are preserved from an
+    existing file so re-saves (after an override or counterfactual) don't lose
+    them. `started_at` is when the interview began — what a caller means by "the
+    4:30 interview"; `candidate_phone` is where their feedback goes."""
     prev = _read(record.interview_id) or {}
     created_at = prev.get("created_at", time.time())
     started_at = started_at or prev.get("started_at")
     candidate_name = candidate_name or prev.get("candidate_name", "")
     role = role or prev.get("role", "")
+    candidate_phone = candidate_phone or prev.get("candidate_phone", "")
     rep = record.report
     data = {
         "interview_id": record.interview_id,
@@ -58,6 +60,8 @@ def save_record(record: PanelRecord, *, candidate_name: str = "", role: str = ""
         "started_at": started_at,
         "candidate_name": candidate_name,
         "role": role,
+        "candidate_phone": candidate_phone,
+        "candidate_feedback": prev.get("candidate_feedback"),
         "recommendation": rep.conclusion.recommendation,
         "headline": rep.conclusion.headline,
         "override": record.overrides[-1].decision if record.overrides else None,
@@ -69,12 +73,36 @@ def save_record(record: PanelRecord, *, candidate_name: str = "", role: str = ""
         "what_ifs": [w.model_dump() for w in record.what_ifs],
         "overrides": [o.model_dump() for o in record.overrides],
     }
-    tmp = _path(record.interview_id) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, _path(record.interview_id))   # atomic
+    _write(record.interview_id, data)
     logger.info("saved interview %s (%s)", record.interview_id, candidate_name or "unnamed")
     return data
+
+
+def _write(interview_id: str, data: dict):
+    tmp = _path(interview_id) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, _path(interview_id))   # atomic
+
+
+def save_feedback(interview_id: str, info: dict):
+    """Record the candidate feedback that was sent (text, number, delivery)."""
+    data = _read(interview_id)
+    if data is not None:
+        data["candidate_feedback"] = info
+        _write(interview_id, data)
+
+
+def candidate_phones() -> set[str]:
+    """Every candidate's WhatsApp number — they receive feedback, never the panel."""
+    d = _dir()
+    phones = set()
+    for fn in os.listdir(d):
+        if fn.endswith(".json"):
+            data = _read(fn[:-5])
+            if data and data.get("candidate_phone"):
+                phones.add(data["candidate_phone"])
+    return phones
 
 
 _SUMMARY_KEYS = ("interview_id", "created_at", "started_at", "candidate_name", "role",

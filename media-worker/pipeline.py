@@ -138,6 +138,11 @@ class InterviewPipeline:
         if self._thread.is_alive():
             self._thread.join(timeout=2)
 
+    @property
+    def concluded(self) -> bool:
+        """The final bell has rung: no more turns, nothing left to interrupt."""
+        return self._concluded
+
     def freeze(self):
         self._concluded = True
         self._generation += 1

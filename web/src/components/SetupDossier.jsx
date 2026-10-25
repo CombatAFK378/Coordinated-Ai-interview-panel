@@ -4,6 +4,7 @@ import { pct, prettyKey } from "../lib/format";
 export default function SetupDossier({
   jd, setJd, resume, setResume, jdMeta, setJdMeta, resumeMeta, setResumeMeta,
   uploading, uploadPdf, parsing, previewDossier, dossier, joined, nameOf,
+  candidatePhone, setCandidatePhone,
 }) {
   return (
     <div className="setup">
@@ -60,6 +61,26 @@ export default function SetupDossier({
             aria-label="Candidate resume"
           />
         </div>
+      </div>
+
+      <div className="setup-phone">
+        <label className="sec-label" htmlFor="candidate-phone">
+          WhatsApp number (optional)
+        </label>
+        <input
+          id="candidate-phone"
+          className="setup-input"
+          type="tel"
+          inputMode="tel"
+          autoComplete="off"
+          placeholder="+91 98765 43210"
+          value={candidatePhone}
+          onChange={(e) => setCandidatePhone(e.target.value)}
+          disabled={joined}
+        />
+        <p className="setup-sub">
+          Add your number to get feedback on your interview performance on WhatsApp.
+        </p>
       </div>
 
       <div className="setup-actions">

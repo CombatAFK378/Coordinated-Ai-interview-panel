@@ -34,8 +34,10 @@ services:
       # Persisted interviews (Phase 8): recruiter dashboard reads/writes here.
       - ./data:/app/data
     # Watch both mounted code dirs so edits to shared/ hot-reload too (default
-    # --reload only watches the app dir, /app/media-worker).
-    command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload --reload-dir /app/media-worker --reload-dir /app/shared
+    # --reload only watches the app dir, /app/media-worker). An open browser events
+    # socket would otherwise stall a reload on "Waiting for background tasks", so
+    # graceful shutdown is capped at 3s.
+    command: uvicorn main:app --host 0.0.0.0 --port 8080 --reload --reload-dir /app/media-worker --reload-dir /app/shared --timeout-graceful-shutdown 3
 
   # Public HTTPS tunnel for Ask the Panel on WhatsApp: Twilio posts incoming
   # messages to https://$NGROK_DOMAIN/whatsapp/webhook. The app serves ONLY that

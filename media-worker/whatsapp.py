@@ -10,6 +10,10 @@ Each recruiter number is its own chat. Julian hosts until an interview is picked
 answer from that locked record, each reply headed with who is speaking — every
 message comes from the one Twilio number, so the header is the identity. Chat
 only reads saved records, so it runs alongside any voice session.
+
+The same number also sends candidates their feedback after scoring
+(send_candidate_feedback). That's one-way: a candidate's number never reaches
+the panel, so their replies cost nothing.
 """
 import base64
 import hashlib
@@ -20,17 +24,26 @@ import os
 import queue
 import re
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 
 import requests
 
 from ask_pipeline import apply_override
-from shared import ask_panel, interview_lookup, prompts, store
+from shared import ask_panel, feedback, interview_lookup, prompts, store
 from shared.panel_routing import PanelRouter
 
 logger = logging.getLogger(__name__)
 
 _MESSAGES_URL = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+_MESSAGE_URL = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages/{msg}.json"
+# Why a WhatsApp message didn't arrive, by Twilio error code.
+_UNDELIVERED = {
+    63016: "outside WhatsApp's 24-hour window — the candidate must message the panel's "
+           "number first",
+    63015: "the candidate's phone hasn't joined the WhatsApp sandbox",
+    63003: "that number isn't on WhatsApp",
+}
 _MAX_BODY = 1500            # Twilio caps a WhatsApp message at 1600 characters
 _LIST_SIZE = 5              # interviews shown in a numbered list
 # A greeting or reset starts the chat fresh, like a brand-new conversation.
@@ -49,8 +62,10 @@ def valid_signature(auth_token: str, url: str, params: dict, signature: str | No
     return hmac.compare_digest(base64.b64encode(digest).decode(), signature or "")
 
 
-def send(settings, to: str, body: str):
-    """Send one reply, split across messages if it's over Twilio's limit."""
+def send(settings, to: str, body: str) -> list[str]:
+    """Send one message, split if it's over Twilio's limit. Returns the ids of
+    the parts Twilio accepted (acceptance isn't delivery — see message_status)."""
+    sids = []
     for part in _chunks(body):
         resp = requests.post(
             _MESSAGES_URL.format(sid=settings.twilio_account_sid),
@@ -61,6 +76,55 @@ def send(settings, to: str, body: str):
         if resp.status_code >= 300:
             logger.error("whatsapp: send to %s failed: HTTP %s %s",
                          to, resp.status_code, resp.text[:200])
+        else:
+            sids.append(resp.json().get("sid", ""))
+    return sids
+
+
+def message_status(settings, sid: str) -> tuple[str, int | None]:
+    """(status, error code) of a sent message: queued, sent, delivered, read,
+    failed or undelivered."""
+    resp = requests.get(
+        _MESSAGE_URL.format(sid=settings.twilio_account_sid, msg=sid),
+        auth=(settings.twilio_account_sid, settings.twilio_auth_token), timeout=10)
+    data = resp.json()
+    return data.get("status", ""), data.get("error_code")
+
+
+def send_candidate_feedback(settings, record, phone: str, name: str = "", role: str = "",
+                            wait_secs: float = 20.0) -> dict:
+    """Write the candidate's feedback and send it to `phone` on WhatsApp, then
+    follow it for a few seconds — WhatsApp refusals (the 24-hour window, a phone
+    that never joined the sandbox) arrive after Twilio accepts the message.
+    Returns what happened, for the record and the UI. Never raises."""
+    info = {"to": phone, "sent_at": time.time(), "status": "error", "detail": "", "text": ""}
+    try:
+        info["text"] = feedback.write_feedback(record, name, role)
+    except Exception as e:
+        logger.exception("feedback: could not write feedback for %s", record.interview_id)
+        info["detail"] = f"couldn't write the feedback ({e})"
+        return info
+    try:
+        sids = send(settings, f"whatsapp:{phone}", info["text"])
+        if not sids:
+            info["detail"] = "Twilio refused the message"
+            return info
+        status, code = "queued", None
+        deadline = time.time() + wait_secs
+        while time.time() < deadline and status not in ("delivered", "read", "failed", "undelivered"):
+            time.sleep(2)
+            status, code = message_status(settings, sids[-1])
+    except Exception as e:
+        logger.exception("feedback: sending to %s failed", phone)
+        info["detail"] = f"sending failed ({e})"
+        return info
+    if status in ("failed", "undelivered"):
+        info.update(status="not_delivered",
+                    detail=_UNDELIVERED.get(code, f"WhatsApp refused it (Twilio error {code})"))
+    else:
+        info["status"] = "delivered" if status in ("delivered", "read") else "sent"
+    logger.info("feedback: %s to %s %s", record.interview_id, phone, info["status"])
+    return info
 
 
 def _chunks(text: str, limit: int = _MAX_BODY):

@@ -20,12 +20,13 @@ from shared.config import get_settings
 from shared.livekit_token import build_room_token
 from shared.panel_routing import PanelRouter
 from shared.models import AskAnswer, Dossier, InterviewReport, Override, SessionStartResponse, WhatIfQuery
-from shared import ask_panel, dossier as dossier_mod, gemini, prompts, scoring, store
+from shared import ask_panel, dossier as dossier_mod, feedback, gemini, prompts, scoring, store
 
 from livekit_session import LiveKitSession
 from pipeline import InterviewPipeline
 from ask_pipeline import AskPipeline
 from phone_line import PhoneLine
+import whatsapp as whatsapp_mod
 from whatsapp import WhatsAppChats, valid_signature
 
 _LOG_FMT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -152,6 +153,7 @@ _report: InterviewReport | None = None   # last locked report (Phase 5)
 _panel_record: ask_panel.PanelRecord | None = None   # for Ask the Panel (Phase 6)
 _dossier: Dossier | None = None          # active interview's dossier (Phase 7)
 _started_at: float | None = None         # when the active interview began
+_candidate_phone: str = ""               # where the active interview's feedback goes
 _phone_line: PhoneLine | None = None     # Ask the Panel by phone
 _phone_done: threading.Event | None = None   # set when the active phone call ends
 _whatsapp: WhatsAppChats | None = None   # Ask the Panel on WhatsApp
@@ -160,6 +162,7 @@ _whatsapp: WhatsAppChats | None = None   # Ask the Panel on WhatsApp
 class StartRequest(BaseModel):
     jd: str = ""                  # job description (§9); empty → generic all-panel
     resume: str = ""             # candidate résumé (§9)
+    candidate_phone: str = ""    # WhatsApp number for post-interview feedback (optional)
 
 
 class DossierRequest(BaseModel):
@@ -343,9 +346,15 @@ def _join_response(settings, room, identity, panel):
 @app.post("/session/start", response_model=SessionStartResponse)
 @serialized
 def session_start(req: StartRequest | None = None):
-    global _session, _pipeline, _report, _panel_record, _dossier, _started_at
-    settings = _voice_settings()
+    global _session, _pipeline, _report, _panel_record, _dossier, _started_at, _candidate_phone
     req = req or StartRequest()
+    phone = ""
+    if req.candidate_phone.strip():
+        phone = feedback.normalize_phone(req.candidate_phone, get_settings().default_country_code)
+        if phone is None:
+            raise HTTPException(400, "That WhatsApp number doesn't look right — include the "
+                                     "country code, e.g. +91 98765 43210.")
+    settings = _voice_settings()
     # Parse before replacing the active session, so a dossier error is recoverable.
     dossier = (dossier_mod.build_dossier(req.jd, req.resume)
                if req.jd.strip() or req.resume.strip() else None)
@@ -353,6 +362,7 @@ def session_start(req: StartRequest | None = None):
     _report = _panel_record = None
     _dossier = dossier
     _started_at = time.time()
+    _candidate_phone = phone
     interview_id = uuid.uuid4().hex[:12]
     _begin_session_logs(interview_id)
     room = f"iv-{interview_id}"
@@ -498,10 +508,40 @@ def session_conclude():
             candidate_name=(_dossier.candidate_name if _dossier else ""),
             role=(_dossier.role if _dossier else ""),
             started_at=_started_at,
+            candidate_phone=_candidate_phone,
         )
     except Exception:
         logger.exception("failed to persist interview %s", _pipeline.interview_id)
+    if _candidate_phone:
+        _send_feedback_later(_panel_record, _candidate_phone,
+                             _dossier.candidate_name if _dossier else "",
+                             _dossier.role if _dossier else "")
     return _report
+
+
+def _send_feedback_later(record, phone: str, name: str, role: str):
+    """After scoring, write and send the candidate's WhatsApp feedback in the
+    background (a reasoning-model call, then Twilio), so the report isn't held
+    up. The UI hears how it went over the events socket."""
+    settings = get_settings()
+    shown = f"{phone[:3]}…{phone[-4:]}"
+    if not settings.whatsapp_enabled:
+        logger.warning("feedback: WhatsApp isn't configured; not sending to %s", shown)
+        _broker.publish({"type": "feedback", "status": "error", "to": shown,
+                         "detail": "WhatsApp isn't configured"})
+        return
+
+    def run():
+        _broker.publish({"type": "feedback", "status": "writing", "to": shown})
+        info = whatsapp_mod.send_candidate_feedback(settings, record, phone, name, role)
+        try:
+            store.save_feedback(record.interview_id, info)
+        except Exception:
+            logger.exception("feedback: could not save the feedback record")
+        _broker.publish({"type": "feedback", "status": info["status"], "to": shown,
+                         "detail": info["detail"]})
+
+    threading.Thread(target=run, daemon=True, name="candidate-feedback").start()
 
 
 @app.post("/panel/join", response_model=SessionStartResponse)
@@ -636,7 +676,7 @@ async def whatsapp_webhook(request: Request):
         logger.warning("whatsapp: rejected a request with a bad Twilio signature")
         raise HTTPException(403, "invalid signature")
     sender = params.get("From", "")
-    if not settings.whatsapp_allows(sender):
+    if not settings.whatsapp_allows(sender, store.candidate_phones()):
         logger.warning("whatsapp: ignoring message from %s (not allowed)", sender)
     elif params.get("Body", "").strip():
         _whatsapp.submit(sender, params["Body"])
@@ -652,7 +692,9 @@ def _on_phone_call(room: str) -> threading.Event | None:
     Returns an Event set when the call ends, or None to refuse it."""
     global _session, _ask_pipeline, _phone_done
     with _lifecycle_lock:
-        if _pipeline is not None:
+        # A scored interview keeps its voice session until the browser leaves;
+        # only one still in progress blocks a call.
+        if _pipeline is not None and not _pipeline.concluded:
             logger.warning("phone: interview %s is live; refusing call in %s",
                            _pipeline.interview_id, room)
             return None

@@ -35,9 +35,12 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_whatsapp_from: str = ""            # e.g. whatsapp:+14155238886 (the sandbox)
-    # Comma-separated numbers allowed to chat (+91…); empty = anyone who joined.
+    # Comma-separated numbers allowed to chat (+91…); empty = anyone who joined
+    # (except candidates, who only ever receive their feedback).
     whatsapp_allowed_numbers: str = ""
     ngrok_domain: str = ""
+    # Prefix for a candidate's WhatsApp number typed without a country code.
+    default_country_code: str = "+91"
 
     # LLM. Every model call goes through the shared router in
     # shared/llm_router.py; never hardcode a model at a call site. Model ids may
@@ -148,10 +151,13 @@ class Settings(BaseSettings):
         return bool(self.twilio_account_sid and self.twilio_auth_token
                     and self.twilio_whatsapp_from)
 
-    def whatsapp_allows(self, sender: str) -> bool:
-        """Is this sender ("whatsapp:+91…") allowed to chat with the panel?"""
+    def whatsapp_allows(self, sender: str, candidates=()) -> bool:
+        """Is this sender ("whatsapp:+91…") allowed to chat with the panel? An
+        allow-listed number always is; with no allow-list, anyone but a candidate
+        (`candidates`: their numbers) — candidates only receive feedback."""
+        number = sender.removeprefix("whatsapp:").strip()
         allowed = {n.strip() for n in self.whatsapp_allowed_numbers.split(",") if n.strip()}
-        return not allowed or sender.removeprefix("whatsapp:").strip() in allowed
+        return number in allowed if allowed else number not in set(candidates)
 
     @property
     def groq_keys(self) -> list[str]:

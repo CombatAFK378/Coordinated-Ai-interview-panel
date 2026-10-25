@@ -471,6 +471,14 @@ button.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--line
 }
 .setup-ta::placeholder { color: var(--text-faint); }
 .setup-ta:focus { border-color: var(--accent-line); }
+.setup-phone { margin-top: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-2); }
+.setup-input {
+  background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3); font-family: inherit;
+  font-size: var(--fs-xs); max-width: 280px;
+}
+.setup-input::placeholder { color: var(--text-faint); }
+.setup-input:focus { border-color: var(--accent-line); }
 .setup-actions { margin-top: var(--sp-4); }
 
 .dossier {

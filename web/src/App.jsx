@@ -58,6 +58,7 @@ export default function App() {
   const [resumeMeta, setResumeMeta] = useState(null);
   const [uploading, setUploading] = useState(null); // "jd" | "resume" | null
   const [dossier, setDossier] = useState(null); // parsed preview
+  const [candidatePhone, setCandidatePhone] = useState(""); // WhatsApp feedback after scoring
   const [parsing, setParsing] = useState(false);
   const [activePanel, setActivePanel] = useState([]); // dossier-selected interviewer ids
   // Phase 8 - recruiter dashboard.
@@ -293,6 +294,15 @@ export default function App() {
             contradictions: ev.contradictions || 0,
           }];
         });
+      } else if (ev.type === "feedback") {
+        // Candidate feedback on WhatsApp, sent in the background after scoring.
+        const msg = {
+          writing: `Writing the candidate's feedback for WhatsApp (${ev.to})…`,
+          sent: `Feedback sent to the candidate on WhatsApp (${ev.to}).`,
+          delivered: `Feedback delivered to the candidate on WhatsApp (${ev.to}).`,
+        }[ev.status] || `Candidate feedback not delivered: ${ev.detail || ev.status}.`;
+        setStatus(msg);
+        log(msg);
       } else if (ev.type === "override" && ev.override) {
         setOverrides((o) => [...o, ev.override]); // override fired by voice
       } else if (ev.type === "coding_task") {
@@ -503,7 +513,7 @@ export default function App() {
       const resp = await fetch("/session/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jd, resume }),
+        body: JSON.stringify({ jd, resume, candidate_phone: candidatePhone }),
       });
       if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
       const s = await resp.json();
@@ -532,6 +542,8 @@ export default function App() {
       log("ERROR: " + (e.message || e));
       if (String(e.message || e).includes("CAMERA_REQUIRED")) {
         setStatus("Camera is required for the interview — allow camera access and Join again.");
+      } else if (String(e.message || e).includes("WhatsApp number")) {
+        setStatus("That WhatsApp number doesn't look right — include the country code, e.g. +91 98765 43210.");
       } else {
         setStatus("Failed to start, see the log.");
       }
@@ -1080,6 +1092,7 @@ export default function App() {
           resumeMeta={resumeMeta} setResumeMeta={setResumeMeta}
           uploading={uploading} uploadPdf={uploadPdf}
           parsing={parsing} previewDossier={previewDossier}
+          candidatePhone={candidatePhone} setCandidatePhone={setCandidatePhone}
           dossier={dossier} joined={joined} nameOf={nameOf}
         />
       )}

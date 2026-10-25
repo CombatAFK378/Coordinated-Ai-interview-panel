@@ -46,6 +46,9 @@ record, never from imagination.
 - **A defensible verdict.** Blind, independent scoring per interviewer; a SHA-256
   lock over the record; a debate where a confident interviewer cannot be talked out
   of their score; a conclusion that reports the split instead of averaging it.
+- **Feedback for the candidate.** After scoring, the candidate gets kind, specific
+  feedback on WhatsApp — what went well and what to work on, drawn from what they
+  actually said — never the scores or the hiring decision.
 - **Talk to the panel afterwards.** A recruiter can join any completed interview's
   panel — straight after it, or days later — and talk to the interviewers by voice,
   in the browser or over a phone call, or chat with them on WhatsApp. Answers come
@@ -237,7 +240,9 @@ the log shows `registered worker` (and, with WhatsApp configured, ngrok's
    (**Upload job description**, **Upload resume**) or paste the text. Leave both
    blank for a generic all-five panel. **Preview dossier** (optional) shows the
    role, the seated panel, competency weights, each interviewer's rubric and the
-   résumé claims the panel will test.
+   résumé claims the panel will test. Optionally add the **candidate's WhatsApp
+   number** to send them feedback after scoring (see
+   [Candidate feedback](#candidate-feedback)).
 3. **Join interview.** The camera is required; the microphone too. Headphones
    avoid echo.
 4. **During the interview:**
@@ -362,3 +367,19 @@ One call at a time; a call is refused while a candidate interview is live.
 Only the webhook is reachable through the tunnel — everything else answers 404 —
 and every request must carry a valid Twilio signature. To clear every chat's state
 from the terminal: `rm -f data/whatsapp/*.json`.
+
+#### Candidate feedback
+
+If you entered the candidate's WhatsApp number before the interview, **Finish and
+score** also sends them feedback from the same WhatsApp number: two or three
+strengths and two or three things to work on, each tied to something they said,
+honest but phrased as friendly suggestions. It never includes scores, the panel's
+recommendation or the hiring outcome — a filter drops any point that would — and
+it's one-way: the candidate's replies never reach the panel. Every message ends
+with *"Our team will evaluate your performance further and reach out to you."* The
+status line shows whether it was delivered.
+
+WhatsApp only lets a business message someone within 24 hours of their last
+message to it, so the candidate's phone should send any message (with the sandbox,
+the `join <code>` message) to the panel's number shortly before the interview. If
+that window has closed, the report status says so.
