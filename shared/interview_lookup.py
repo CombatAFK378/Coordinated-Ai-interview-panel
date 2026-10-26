@@ -73,10 +73,13 @@ def parse_request(text: str, current: datetime) -> Hints:
         {"role": "user", "content": f"Current local date and time: "
                                     f"{current:%A %Y-%m-%d %H:%M}.\nRecruiter said: \"{text}\""},
     ]
+    s = get_settings()
     try:
-        # gpt-oss reasons before the JSON, so leave headroom over the tiny answer.
+        # Same fast lane as Ask the Panel answers. gpt-oss reasons before the
+        # JSON, so leave headroom over the tiny answer.
         data = scoring._parse_json(llm_router.chat(
-            messages, max_tokens=400, temperature=0.0, reasoning_effort="low"))
+            messages, model=s.llm_ask_model, fallbacks=s.ask_fallbacks,
+            max_tokens=400, temperature=0.0, reasoning_effort="low"))
     except Exception as e:
         logger.warning("interview lookup parse failed (%s); matching raw words", e)
         return Hints(name=text)

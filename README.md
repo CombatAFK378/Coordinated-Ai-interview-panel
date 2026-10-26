@@ -169,10 +169,12 @@ cross-provider fallback chain:
 
 | Job | Primary | Fallbacks |
 |---|---|---|
-| Bids + claim extraction (×5 in parallel per turn), questions, Ask the Panel answers | `ollama:gpt-oss:120b` | Groq `gpt-oss-120b` (key pool) → Gemini 2.5 Flash |
+| Bids + claim extraction (×5 in parallel per turn), interview questions | `ollama:gpt-oss:120b` | Groq `gpt-oss-120b` (key pool) → Gemini 2.5 Flash |
+| Ask the Panel answers (voice + WhatsApp), "which interview?" lookup | Groq `gpt-oss-120b` (key pool) — ~1 s faster | `ollama:gpt-oss:120b` → Gemini 2.5 Flash |
 | Dossier, blind scoring, debate, conclusion, counterfactuals | `ollama:minimax-m3` (thinking off) | Gemini 2.5 Flash → Groq `gpt-oss-120b` |
 | Live coding round (screen + voice) | Gemini Live (`gemini-3.1-flash-live-preview`), in the browser | Screenshot reads via an OpenRouter vision model |
-| Speech | Deepgram `nova-3` STT · Deepgram Aura-2 TTS, one voice per persona | — |
+| Speech-to-text | Deepgram `nova-3`, Indian English (`en-IN`) | Sarvam `saaras:v3` — switch with `STT_PROVIDER=sarvam` |
+| Voices | Deepgram Aura-2, one voice per persona | — |
 | Turn-taking audio | LiveKit `v1-mini` turn detector (runs locally) + Silero VAD | — |
 
 The rule: **fast model where the candidate is waiting, deep model where the decision
@@ -195,7 +197,8 @@ session at a time; WhatsApp chats run alongside it.
 | [LiveKit Cloud](https://cloud.livekit.io/) | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | **Required** — all real-time voice (BVC noise cancellation needs LiveKit Cloud) |
 | [Deepgram](https://deepgram.com/) | `DEEPGRAM_API_KEY` | **Required** — speech-to-text and the six voices |
 | [Ollama Cloud](https://ollama.com/) | `OLLAMA_API_KEY` | **Required** — interviewers and orchestrator (a paid plan avoids rate limits) |
-| [Groq](https://console.groq.com/) | `GROQ_API_KEY` or `GROQ_API_KEYS` (comma-separated pool) | Optional — fast-path fallback |
+| [Groq](https://console.groq.com/) | `GROQ_API_KEY` or `GROQ_API_KEYS` (comma-separated pool) | Recommended — fastest Ask the Panel answers, and the interview's fallback |
+| [Sarvam](https://www.sarvam.ai/) | `SARVAM_API_KEY` | Optional — speech-to-text tuned for Indian accents (`STT_PROVIDER=sarvam`) |
 | [Google AI Studio](https://aistudio.google.com/) | `GEMINI_API_KEY` | Optional — the Gemini Live coding round, and a model fallback |
 | [OpenRouter](https://openrouter.ai/) | `OPENROUTER_API_KEY` | Optional — screenshot-based coding round when Gemini isn't set |
 | LiveKit phone number | — (see [By phone](#5-ask-the-panel-by-phone)) | Optional — Ask the Panel by phone |

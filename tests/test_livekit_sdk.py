@@ -106,3 +106,15 @@ def test_failed_rtc_connection_closes_event_loop(settings, monkeypatch):
     assert not transport._thread.is_alive()
     assert transport._loop.is_closed()
     assert transport._http.closed
+
+
+def test_stt_provider_is_chosen_from_settings(settings, monkeypatch):
+    import livekit_session
+    monkeypatch.setattr(livekit_session.deepgram, 'STT', lambda **kw: ('deepgram', kw))
+    monkeypatch.setattr(livekit_session.sarvam, 'STT', lambda **kw: ('sarvam', kw))
+    session = LiveKitSession(settings, 'room', 'candidate')
+    assert session._make_stt()[0] == 'deepgram'
+    sarvam_settings = settings.model_copy(update={'stt_provider': 'sarvam', 'sarvam_api_key': 'sk',
+                                                  'livekit_stt_language': 'en-IN'})
+    name, kw = LiveKitSession(sarvam_settings, 'room', 'candidate')._make_stt()
+    assert name == 'sarvam' and kw['model'] == 'saaras:v3' and kw['language'] == 'en-IN'

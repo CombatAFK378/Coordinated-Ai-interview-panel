@@ -167,6 +167,12 @@ _BID_RULES = (
     "hand-wavy, unquantified). Extract at most 2, and use [] if they said nothing "
     "new in your area. If a claim clearly conflicts with something said earlier, "
     "put a short note in `contradicts`, else null.\n"
+    "If the LATEST question (quoted after the conversation) was in YOUR area and the "
+    "candidate could not answer or explain it (\"I don't know\", \"I don't remember\", "
+    "a deflection), record that as a claim too: `text` \"Could not answer: <that "
+    "question, in a few words>\", status \"VAGUE\", strength 0.7 — a demonstrated gap, "
+    "not missing evidence. Only for that latest question; never re-record earlier "
+    "ones. If it was about a résumé claim, name that claim in `contradicts`.\n"
     "\nRespond with ONLY compact JSON, nothing else:\n"
     '{{"interest": <float>, "reason": "<= 12 words>", '
     '"claims_noticed": [{{"text": "...", "competency": "...", "strength": <float>, '
@@ -372,7 +378,15 @@ def build_bid_prompt(agent_id: str, transcript: list[TranscriptTurn], context: s
     system = (agent.persona + (f"\n\n{context}" if context else "")
               + _BID_RULES.format(focus=agent.focus or agent.title, comps=comps))
     convo = _flatten_transcript(transcript) or "(nothing said yet)"
-    user = f"Conversation so far:\n\n{convo}\n\nNow output ONLY your JSON."
+    # Name the question the candidate just answered, so a gap is pinned to it
+    # rather than to an earlier question still in view.
+    latest = ""
+    if transcript and transcript[-1].speaker == "candidate":
+        asked = next((t for t in reversed(transcript[:-1]) if t.speaker in AGENTS), None)
+        if asked is not None:
+            latest = (f"\n\nThe LATEST question, which the candidate just answered, was "
+                      f"asked by the {AGENTS[asked.speaker].title}: \"{asked.text}\"")
+    user = f"Conversation so far:\n\n{convo}{latest}\n\nNow output ONLY your JSON."
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -383,8 +397,14 @@ _SCORING_RULES = (
     "but ONLY the ones you actually have evidence for from the transcript/ledger.\n"
     "- For a competency that WAS explored: 0.0 (probed and clearly weak) to 1.0 "
     "(strong, well-evidenced). A low score means they were asked and fell short.\n"
+    "- A question in your area the candidate could not answer ('Could not answer: …' "
+    "in the ledger, or 'I don't know' / 'I don't remember' in the transcript) IS "
+    "evidence — of a gap. Score that competency low; never omit it.\n"
+    "- UNVERIFIED résumé claims are only claims: they earn no credit unless the "
+    "candidate backed them up when asked.\n"
     "- For a competency that never came up or has no evidence: OMIT it entirely. "
     "Do NOT score it low — 'not asked' is NOT the same as 'weak'.\n"
+    "- `overall` must be consistent with your competency scores.\n"
     "- Set `overall` from only what you could actually assess. If you have "
     "essentially no evidence in your area, return an empty competency_scores, an "
     "`overall` of 0.5, and say 'not assessed' in the rationale.\n"
@@ -411,12 +431,16 @@ _CONCLUSION_RULES = (
     "recommendation:\n"
     "- PROCEED — clear, well-evidenced yes.\n"
     "- PROCEED_FLAGGED — yes, with specific reservations to check.\n"
-    "- INSUFFICIENT_SIGNAL — the interview was short or thinly evidenced; too little "
-    "was actually probed to judge fairly. Recommend a human screen. This is the "
-    "right call for a partial interview — do NOT DECLINE merely for missing or "
-    "un-probed evidence.\n"
-    "- DECLINE — ONLY when the candidate was genuinely probed and demonstrably fell "
-    "short, with evidence of weakness (not just absence of evidence).\n"
+    "- INSUFFICIENT_SIGNAL — too little was ASKED to judge fairly: a very short or "
+    "partial interview, or answers that weren't captured. Recommend a human screen. "
+    "Do NOT DECLINE merely for un-probed areas — but never use this when the "
+    "candidate WAS asked and couldn't answer.\n"
+    "- DECLINE — the candidate was probed and demonstrably fell short: repeated "
+    "'could not answer', résumé claims they couldn't back up, a failed coding round, "
+    "or outside AI help. Questions they couldn't answer are evidence of weakness, "
+    "not absence of evidence.\n"
+    "An integrity flag (outside AI help during the coding round) is a serious "
+    "concern: never PROCEED.\n"
     "List unresolved items a human should verify, each with its turn/claim evidence. "
     "You report what the panel concluded; you do not out-vote anyone.\n"
     "Output ONLY compact JSON:\n"

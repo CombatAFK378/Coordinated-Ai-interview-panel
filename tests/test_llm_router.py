@@ -51,3 +51,35 @@ def test_fast_path_falls_back_from_ollama_to_groq_pool(monkeypatch):
     assert {c[1] for c in ollama} == {'Bearer o-key'}
     assert ollama[0][2]['model'] == 'gpt-oss:120b'
     assert 'groq.com' in calls[-1][0]
+
+
+def test_explicit_fallbacks_and_no_wait_when_rotating_keys(monkeypatch):
+    """Ask the Panel: Groq pool first, then Ollama. A rate-limited key rotates to
+    the next key at once; only after every key is tried does it back off."""
+    settings = Settings(_env_file=None, ollama_api_key='o-key', groq_api_keys='g1,g2,g3')
+    monkeypatch.setattr(llm_router, 'get_settings', lambda: settings)
+    sleeps = []
+    monkeypatch.setattr(llm_router.time, 'sleep', sleeps.append)
+    calls = []
+
+    def post(url, headers, json, timeout):
+        calls.append((url, headers['Authorization']))
+        return _response(429) if 'groq.com' in url else _response(200, 'from ollama')
+
+    monkeypatch.setattr(llm_router.requests, 'post', post)
+    out = llm_router.chat([{'role': 'user', 'content': 'hi'}], model='groq:openai/gpt-oss-120b',
+                          fallbacks=['ollama:gpt-oss:120b'], retries=2)
+    assert out == 'from ollama'
+    assert sorted(c[1] for c in calls[:3]) == ['Bearer g1', 'Bearer g2', 'Bearer g3']
+    assert sleeps == [0.0, 0.0]            # fresh keys: no wait; out of retries: no wait
+
+
+def test_ask_the_panel_uses_its_own_fast_lane(record, monkeypatch):
+    from shared import ask_panel
+    settings = Settings(_env_file=None)
+    monkeypatch.setattr(ask_panel, 'get_settings', lambda: settings)
+    seen = Mock(return_value='Grounded')
+    monkeypatch.setattr(ask_panel.llm_router, 'chat', seen)
+    ask_panel.answer(record, 'Liam, why that score?', 'addressed', 'coding')
+    assert seen.call_args.kwargs['model'] == 'groq:openai/gpt-oss-120b'
+    assert seen.call_args.kwargs['fallbacks'] == ['ollama:gpt-oss:120b', 'gemini:gemini-2.5-flash']

@@ -12,6 +12,7 @@ pypdf
 livekit-agents==1.8.2
 livekit-api==1.2.1
 livekit-plugins-deepgram==1.8.2
+livekit-plugins-sarvam==1.8.2
 livekit-plugins-silero==1.8.2
 livekit-plugins-noise-cancellation==0.3.2
 # v1-mini is built into Agents; the deprecated text turn-detector plugin is unnecessary.

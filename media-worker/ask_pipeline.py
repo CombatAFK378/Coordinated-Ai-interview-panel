@@ -243,21 +243,37 @@ class AskPipeline:
                 return
             target = self.router.resolve(text)
             logger.info("ask: routing to %s", target or "open/orchestrator")
+            asked = time.monotonic()
             if target:
                 ans = ask_panel.answer(self.record, text, mode="addressed", target=target)
             else:
                 ans = ask_panel.answer(self.record, text)   # open → Orchestrator + override tool
+            answer_s = time.monotonic() - asked
             if not self._current():
                 return
             logger.info("ask: %s answers: %r", ans.answered_by, (ans.answer or "")[:160])
             if ans.override is not None:
                 self._emit({"type": "override", "override": ans.override.model_dump()})
             self._speak(ans.answered_by, ans.answer)
+            self._log_latency(answer_s)
         except Exception:
             logger.exception("ask answer failed")
             self._emit({"type": "voice_error", "message": "Panel response failed. Please retry."})
         finally:
             self._emit({"type": "idle"})
+
+    def _log_latency(self, answer_s: float):
+        """One line per answered question: where the wait between the recruiter's
+        last word and the panel's voice went."""
+        parts, total = [], 0.0
+        for label, value in (("turn end", getattr(self.session, "last_turn_end_s", None)),
+                             ("answer", answer_s),
+                             ("first audio", getattr(self.session, "last_first_audio_s", None))):
+            if isinstance(value, (int, float)):
+                parts.append(f"{label} {value:.2f}s")
+                total += value
+        logger.info("latency: %s = %.2fs from your last word to the panel's voice",
+                    " + ".join(parts), total)
 
     # ---- phone lobby: which interview? ---------------------------------------
 

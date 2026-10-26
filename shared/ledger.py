@@ -16,6 +16,13 @@ import uuid
 from shared.competencies import Competency
 from shared.models import Claim
 
+# Evidence that the coding round broke the assessment rules (outside AI help).
+# Scoring keys off it: such an interview can never be a plain PROCEED.
+INTEGRITY_FLAG = "integrity flag"
+# Prefix of evidence that the candidate was asked something and couldn't answer —
+# a demonstrated gap, not missing evidence.
+NOT_ANSWERED = "Could not answer"
+
 
 def _tokens(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))

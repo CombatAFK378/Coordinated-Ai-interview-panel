@@ -82,11 +82,13 @@ def chat(
     retries: int = 2,
     reasoning_effort: str | None = None,
     use_fallback_chain: bool = True,
+    fallbacks: list[str] | None = None,
 ) -> str:
     """Return the assistant message text for `messages`.
 
-    `model` is the preferred id (defaults to the fast model); the configured
-    fallback chain is appended after it. Raises LLMError if all fail.
+    `model` is the preferred id (defaults to the fast model); the fallback chain
+    is appended after it — `fallbacks` if given, else the configured fast-path
+    chain. Raises LLMError if all fail.
 
     `reasoning_effort` ("low"/"medium"/"high"/"none") caps how much a reasoning
     model thinks before answering. gpt-oss reasons by default, which with a tight
@@ -98,7 +100,8 @@ def chat(
     primary = model or settings.llm_fast_model
     chain = [primary]
     if use_fallback_chain:
-        chain += [m for m in settings.fallback_models if m != primary]
+        chain += [m for m in (fallbacks if fallbacks is not None else settings.fallback_models)
+                  if m != primary]
 
     last_err: Exception | None = None
     for model_id in chain:
@@ -125,7 +128,14 @@ def chat(
                 )
             except _Transient as e:
                 last_err = e
-                backoff = min(0.5 * (2 ** attempt), 4.0)
+                if attempt == retries:   # out of retries: on to the next model, no wait
+                    logger.warning("LLM %s transient error (%s); trying next in chain",
+                                   model_id, e)
+                    break
+                # The next attempt rotates to a fresh key in a pool: no need to wait
+                # out this key's limit. Back off only once every key has been tried.
+                fresh_key = len(keys) > 1 and (attempt + 1) % len(keys) != 0
+                backoff = 0.0 if fresh_key else min(0.5 * (2 ** attempt), 4.0)
                 logger.warning(
                     "LLM %s transient error (%s); retry %d/%d in %.1fs",
                     model_id, e, attempt + 1, retries, backoff,

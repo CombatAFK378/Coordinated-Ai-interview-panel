@@ -19,7 +19,7 @@ from shared import gemini
 from shared import llm_router, orchestrator, prompts
 from shared.competencies import DEFAULT_COMPETENCIES, Competency
 from shared.config import Settings
-from shared.ledger import Ledger
+from shared.ledger import INTEGRITY_FLAG, Ledger
 from shared.models import AuditEvent, Dossier, TranscriptTurn
 
 logger = logging.getLogger(__name__)
@@ -580,7 +580,7 @@ class InterviewPipeline:
         detail = (detail or "").strip()
         if verdict == "cheating":
             self.ledger.add(
-                text=f"Coding round: outside/AI help detected — integrity flag, coding "
+                text=f"Coding round: outside/AI help detected — {INTEGRITY_FLAG}, coding "
                      f"not demonstrated. {detail[:180]}",
                 competency="coding", source_turn=self._seq, strength=0.9,
                 status="SOLID", noticed_by="coding")
@@ -625,7 +625,7 @@ class InterviewPipeline:
                 cheat = _looks_like_cheating(read)
                 self.ledger.add(
                     text=(f"Coding round (final screen): {read}" if not cheat else
-                          f"Coding round: AI assistant visible — integrity flag. {read}"),
+                          f"Coding round: AI assistant visible — {INTEGRITY_FLAG}. {read}"),
                     competency="coding", source_turn=self._seq,
                     strength=0.9 if cheat else 0.7, status="SOLID", noticed_by="vision")
                 logger.info("coding vision assessment recorded (conclude)")

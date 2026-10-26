@@ -114,7 +114,7 @@ def test_override_by_chat_is_deterministic(chat, record):
 
 def test_long_replies_are_split():
     parts = list(whatsapp._chunks('word ' * 700))
-    assert len(parts) == 3 and all(len(p) <= 1500 for p in parts)
+    assert len(parts) == 3 and all(len(p) <= 1600 for p in parts)
 
 
 def test_signature():

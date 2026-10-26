@@ -9,12 +9,13 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
+import time
 from dataclasses import dataclass
 
 import aiohttp
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, inference, room_io
-from livekit.plugins import deepgram, noise_cancellation, silero
+from livekit.plugins import deepgram, noise_cancellation, sarvam, silero
 
 from shared import prompts
 from shared.livekit_token import build_room_token
@@ -38,6 +39,14 @@ class PanelVoiceAgent(Agent):
         # returns without a second automatic response. Domain work runs off-loop.
         text = new_message.text_content.strip()
         self.transport._partial = ""
+        # How long after the user stopped talking the turn was committed (the SDK
+        # attaches it to the user's message).
+        turn = new_message.metrics or {}
+        if turn.get("end_of_turn_delay") is not None:
+            self.transport.last_turn_end_s = turn["end_of_turn_delay"]
+            logger.info("latency: turn end committed %.2fs after you stopped talking "
+                        "(final transcript at %.2fs)", turn["end_of_turn_delay"],
+                        turn.get("transcription_delay") or 0.0)
         if text and self.transport.on_text:
             self.transport.on_text(text)
 
@@ -77,6 +86,11 @@ class LiveKitSession:
         self._shutdown = None
         self._stopping = False
         self._speaking = threading.Event()
+        # Latency of the latest turn, for the per-turn log: how long after the
+        # user stopped talking the turn was committed, and how long the voice took
+        # to produce its first audio once the text was ready.
+        self.last_turn_end_s: float | None = None
+        self.last_first_audio_s: float | None = None
         self._ready = concurrent.futures.Future()
         self._thread = threading.Thread(target=self._run, daemon=True, name="livekit-io")
 
@@ -130,15 +144,22 @@ class LiveKitSession:
             self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
 
+    def _make_stt(self):
+        """The speech-to-text engine chosen in .env (STT_PROVIDER)."""
+        s = self.settings
+        if s.stt_provider == "sarvam":
+            return sarvam.STT(api_key=s.sarvam_api_key, model=s.sarvam_stt_model,
+                              language=s.livekit_stt_language, http_session=self._http)
+        return deepgram.STT(api_key=s.deepgram_api_key, model=s.livekit_stt_model,
+                            language=s.livekit_stt_language, http_session=self._http)
+
     async def _connect(self):
         self._http = aiohttp.ClientSession()
         self._room = rtc.Room()
-        self._stt = deepgram.STT(
-            api_key=self.settings.deepgram_api_key,
-            model=self.settings.livekit_stt_model,
-            language=self.settings.livekit_stt_language,
-            http_session=self._http,
-        )
+        self._stt = self._make_stt()
+        logger.info("STT: %s (%s, %s)", self.settings.stt_provider,
+                    self.settings.sarvam_stt_model if self.settings.stt_provider == "sarvam"
+                    else self.settings.livekit_stt_model, self.settings.livekit_stt_language)
         self._voices = {
             aid: deepgram.TTS(api_key=self.settings.deepgram_api_key,
                               model=agent.voice_model, http_session=self._http)
@@ -221,15 +242,20 @@ class LiveKitSession:
         # Streaming plugin audio is supplied per utterance, so switching voices
         # cannot leave an old Agent handoff or a second listener running.
         frames = {"n": 0}
+        started = time.monotonic()
+        self.last_first_audio_s = None
 
         async def audio():
             async with self._voices[agent_id].stream() as stream:
                 stream.push_text(text)
                 stream.end_input()
                 async for event in stream:
+                    if frames["n"] == 0:
+                        self.last_first_audio_s = time.monotonic() - started
                     frames["n"] += 1
                     yield event.frame
-            logger.info("TTS[%s] produced %d frames", agent_id, frames["n"])
+            logger.info("TTS[%s] produced %d frames, first audio after %.2fs",
+                        agent_id, frames["n"], self.last_first_audio_s or 0.0)
 
         self._speaking.set()
         try:

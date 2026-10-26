@@ -509,6 +509,8 @@ export default function App() {
     joining.current = true;
     setBusy(true);
     setStatus("Starting session, building the panel from the dossier");
+    const clicked = performance.now();
+    const since = () => `${((performance.now() - clicked) / 1000).toFixed(1)}s`;
     try {
       const resp = await fetch("/session/start", {
         method: "POST",
@@ -532,12 +534,13 @@ export default function App() {
       setAgentCap(null);
       setCandCap(null);
       log(`room=${s.room} identity=${s.identity} panel=${(s.panel || []).join(",")}`);
+      log(`join: session ready ${since()} after clicking Join (dossier + room)`);
       setStatus("Joining the channel");
       await connectLiveKit(s, true);   // camera is mandatory for the interview
       setJoined(true);
       setMicMuted(false);
       setStatus("Live. The panel will greet you shortly.");
-      log("mic + camera published");
+      log(`mic + camera published — join: in the room ${since()} after clicking Join`);
     } catch (e) {
       log("ERROR: " + (e.message || e));
       if (String(e.message || e).includes("CAMERA_REQUIRED")) {

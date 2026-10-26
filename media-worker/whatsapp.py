@@ -44,7 +44,7 @@ _UNDELIVERED = {
     63015: "the candidate's phone hasn't joined the WhatsApp sandbox",
     63003: "that number isn't on WhatsApp",
 }
-_MAX_BODY = 1500            # Twilio caps a WhatsApp message at 1600 characters
+_MAX_BODY = 1600            # Twilio's cap for one WhatsApp message
 _LIST_SIZE = 5              # interviews shown in a numbered list
 # A greeting or reset starts the chat fresh, like a brand-new conversation.
 _GREETINGS = {"hi", "hello", "hey", "hii", "start", "hi julian", "hey julian", "hello julian"}

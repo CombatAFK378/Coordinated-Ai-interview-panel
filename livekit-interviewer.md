@@ -99,7 +99,7 @@ coding round.
 | Debate statements | once, ×5 | none | MiniMax M3 |
 | Orchestrator conclusion | once | none | MiniMax M3 |
 | Dossier / panel composition | once, at creation | none | MiniMax M3 |
-| Ask the Panel replies | on demand | ~1–2s | `ollama:gpt-oss:120b` |
+| Ask the Panel replies | on demand | ~0.7s | `groq:openai/gpt-oss-120b` (then Ollama, Gemini) |
 | Counterfactual re-score | on demand | ~2–4s | MiniMax M3 |
 
 Rule: **fast model where the candidate is waiting, deep model where the decision

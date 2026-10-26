@@ -60,6 +60,14 @@ def test_bare_override_asks_which_way(record):
     assert apply_override(record, 'what was the overview?') is None
 
 
+def test_latency_line_adds_up_the_turn(settings, record, caplog):
+    session = Mock(last_turn_end_s=0.6, last_first_audio_s=0.3)
+    with caplog.at_level('INFO'):
+        AskPipeline(session, settings, record)._log_latency(0.7)
+    assert ('turn end 0.60s + answer 0.70s + first audio 0.30s = 1.60s '
+            "from your last word to the panel's voice") in caplog.text
+
+
 def test_named_answer_uses_that_personas_voice(settings, record, monkeypatch):
     def answer(record, question, mode='open', target=None):
         return AskAnswer(question=question, mode=mode, target=target,

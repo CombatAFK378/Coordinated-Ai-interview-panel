@@ -17,11 +17,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 from shared import llm_router, prompts
 from shared.config import get_settings
+from shared.ledger import INTEGRITY_FLAG, NOT_ANSWERED
 from shared.models import (
-    CONVICTION_NEUTRAL, CONVICTION_STRONG,
+    CLAIM_SOLID, CLAIM_UNVERIFIED, CONVICTION_NEUTRAL, CONVICTION_STRONG,
     REC_DECLINE, REC_INSUFFICIENT, REC_PROCEED, REC_PROCEED_FLAGGED,
     AgentScore, DebateStatement, InterviewReport, PanelConclusion,
 )
+
+# Fewer candidate answers than this: too little was asked to judge.
+MIN_ANSWERS_TO_JUDGE = 3
+# A model `overall` further than this from the mean of its own competency scores
+# is replaced by that mean (a "not assessed" 0.5 next to competency 0.0s).
+OVERALL_TOLERANCE = 0.2
 
 logger = logging.getLogger(__name__)
 
@@ -172,8 +179,10 @@ def score_agent(agent_id: str, transcript: list, claims: list, interview_id: str
                 context: str = "") -> AgentScore:
     my_comps = set(prompts._agent_competencies(agent_id))
     # evidence_count for conviction is the objective count of ledger claims in this
-    # agent's area, computed regardless of whether the model call succeeds.
-    ev_count = sum(1 for c in claims if c.competency in my_comps)
+    # agent's area, computed regardless of whether the model call succeeds. Résumé
+    # claims nobody backed up are not evidence.
+    ev_count = sum(1 for c in claims
+                   if c.competency in my_comps and c.status != CLAIM_UNVERIFIED)
     try:
         raw = reason(prompts.build_scoring_prompt(agent_id, transcript, claims, context), max_tokens=1100)
         data = _parse_json(raw)
@@ -188,7 +197,12 @@ def score_agent(agent_id: str, transcript: list, claims: list, interview_id: str
             rationale="Automatic scoring was unavailable for this interviewer (model error).",
         )
     comp = {str(k): _clamp(v) for k, v in (data.get("competency_scores") or {}).items()}
-    overall = _clamp(data.get("overall", (sum(comp.values()) / len(comp)) if comp else 0.5))
+    mean = (sum(comp.values()) / len(comp)) if comp else 0.5
+    overall = _clamp(data.get("overall", mean))
+    if comp and abs(overall - mean) > OVERALL_TOLERANCE:
+        logger.info("scoring %s: overall %.2f contradicts its own competency scores "
+                    "(mean %.2f); using the mean", agent_id, overall, mean)
+        overall = mean
     evidence = [str(e) for e in (data.get("evidence") or [])][:20]
     return AgentScore(
         interview_id=interview_id, agent_id=agent_id,
@@ -289,7 +303,7 @@ def run_debate(scores: list[AgentScore], interview_id: str) -> list[DebateStatem
 
 def conclude(interview_id: str, scores: list[AgentScore],
              statements: list[DebateStatement], coverage: dict,
-             claims: list) -> PanelConclusion:
+             claims: list, candidate_answers: int | None = None) -> PanelConclusion:
     scores_summary = "\n".join(
         f"- {prompts.AGENTS[s.agent_id].name} ({s.agent_id}): {s.overall:.2f} ({s.conviction}); {s.rationale}"
         for s in scores
@@ -299,11 +313,23 @@ def conclude(interview_id: str, scores: list[AgentScore],
         f"{' [STRONG hold enforced]' if st.rejected else ''} — {st.statement}"
         for st in statements
     ) or "(no debate)"
-    solid = sum(1 for c in claims if c.status == "SOLID")
+    solid = sum(1 for c in claims if c.status == CLAIM_SOLID)
+    gaps = sum(1 for c in claims if c.text.startswith(NOT_ANSWERED))
+    unbacked = sum(1 for c in claims if c.status == CLAIM_UNVERIFIED)
+    integrity = any(INTEGRITY_FLAG in c.text.lower() for c in claims)
     mean_cov = (sum(coverage.values()) / len(coverage)) if coverage else 0.0
-    cov_summary = (", ".join(f"{k} {int(v * 100)}%" for k, v in coverage.items()) or "(none)"
-                   + f"\nEvidence volume: {len(claims)} claims ({solid} solid); "
-                   f"mean coverage {int(mean_cov * 100)}%. Thin evidence → INSUFFICIENT_SIGNAL, not DECLINE.")
+    evidence = [f"Evidence: {solid} solid claims; {gaps} questions the candidate could "
+                f"not answer; {unbacked} résumé claims never backed up (they count toward "
+                f"coverage but are only claims). Mean coverage {int(mean_cov * 100)}%."]
+    if candidate_answers is not None:
+        evidence.append(f"The candidate answered {candidate_answers} questions.")
+        if candidate_answers < MIN_ANSWERS_TO_JUDGE:
+            evidence.append("Very few questions were asked — too little to judge: "
+                            "INSUFFICIENT_SIGNAL, not DECLINE.")
+    if integrity:
+        evidence.append("INTEGRITY FLAG: outside AI help was detected in the coding round.")
+    cov_summary = ((", ".join(f"{k} {int(v * 100)}%" for k, v in coverage.items()) or "(none)")
+                   + "\n" + " ".join(evidence))
     try:
         data = _parse_json(reason(prompts.build_conclusion_prompt(scores_summary, debate_summary, cov_summary), max_tokens=1100))
     except Exception as e:
@@ -317,6 +343,10 @@ def conclude(interview_id: str, scores: list[AgentScore],
     # never DECLINE, always flag for a human (§5). Nuanced calls stay with the model.
     if len(claims) < 2 and rec == REC_DECLINE:
         rec = REC_INSUFFICIENT
+    # An integrity flag can never be a clean pass; at most proceed-with-flags.
+    if integrity and rec == REC_PROCEED:
+        logger.info("conclusion: PROCEED with an integrity flag → PROCEED_FLAGGED")
+        rec = REC_PROCEED_FLAGGED
     unresolved = [
         {"item": str(u.get("item", "")), "evidence": str(u.get("evidence", ""))}
         for u in (data.get("unresolved") or []) if isinstance(u, dict)
@@ -336,7 +366,8 @@ def build_report(interview_id: str, panel: list[str], transcript: list,
     scores = lock(panel, transcript, claims, interview_id, contexts)
     locked_hash = canonical_hash(transcript, claims, scores)
     statements = run_debate(scores, interview_id)
-    conclusion = conclude(interview_id, scores, statements, coverage, claims)
+    answers = sum(1 for t in transcript if t.speaker == "candidate")
+    conclusion = conclude(interview_id, scores, statements, coverage, claims, answers)
     logger.info("scoring done: recommendation=%s hash=%s", conclusion.recommendation, locked_hash[:12])
     return InterviewReport(
         interview_id=interview_id, scores=scores, debate=statements,

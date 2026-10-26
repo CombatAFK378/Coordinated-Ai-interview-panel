@@ -260,8 +260,8 @@ async def session_events(ws: WebSocket):
         while True:
             event = await q.get()
             await ws.send_json(event)
-    except WebSocketDisconnect:
-        pass
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass   # the browser left, or the server is stopping (graceful shutdown is capped)
     except Exception:
         logger.exception("events websocket error")
     finally:
@@ -314,6 +314,7 @@ def _voice_settings():
         "LIVEKIT_API_KEY": settings.livekit_api_key,
         "LIVEKIT_API_SECRET": settings.livekit_api_secret,
         "DEEPGRAM_API_KEY": settings.deepgram_api_key,
+        **({"SARVAM_API_KEY": settings.sarvam_api_key} if settings.stt_provider == "sarvam" else {}),
     }.items() if not value]
     if not (settings.ollama_api_key or settings.groq_keys
             or settings.openrouter_api_key or settings.gemini_api_key):
@@ -356,8 +357,11 @@ def session_start(req: StartRequest | None = None):
                                      "country code, e.g. +91 98765 43210.")
     settings = _voice_settings()
     # Parse before replacing the active session, so a dossier error is recoverable.
+    parse_started = time.monotonic()
     dossier = (dossier_mod.build_dossier(req.jd, req.resume)
                if req.jd.strip() or req.resume.strip() else None)
+    if dossier is not None:
+        logger.info("join: dossier built in %.1fs", time.monotonic() - parse_started)
     _teardown()
     _report = _panel_record = None
     _dossier = dossier

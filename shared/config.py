@@ -16,10 +16,15 @@ class Settings(BaseSettings):
     livekit_api_secret: str = ""
     livekit_noise_cancellation: Literal["bvc", "nc", "off"] = "bvc"
     livekit_stt_model: str = "nova-3"
-    livekit_stt_language: str = "en-US"
+    livekit_stt_language: str = "en-IN"         # Indian English (Deepgram nova-3)
     livekit_endpointing_min_delay: float = Field(default=0.5, ge=0)
     livekit_endpointing_max_delay: float = Field(default=4.0, gt=0)
-    deepgram_api_key: str = ""
+    deepgram_api_key: str = ""                  # every voice (Aura), and STT if chosen
+    # Speech-to-text engine: Deepgram (livekit_stt_model) or Sarvam, built for
+    # Indian accents and names. Both use livekit_stt_language (e.g. en-IN).
+    stt_provider: Literal["deepgram", "sarvam"] = "deepgram"
+    sarvam_api_key: str = ""
+    sarvam_stt_model: str = "saaras:v3"
 
     # Ask the Panel by phone. A LiveKit dispatch rule (media-worker/phone_setup.py)
     # sends calls to the panel's number to an agent of this name; the worker
@@ -71,6 +76,11 @@ class Settings(BaseSettings):
     llm_reasoning_fallbacks: str = "gemini:gemini-2.5-flash,groq:openai/gpt-oss-120b"
     # Fast-path fallbacks, tried in order after llm_fast_model. Comma-separated.
     llm_fallback_chain: str = "groq:openai/gpt-oss-120b,gemini:gemini-2.5-flash"
+    # Ask the Panel answers (voice and WhatsApp) and the "which interview?" lookup:
+    # one call per question, so the Groq key pool keeps up — about 1s faster than
+    # Ollama (0.7s vs 1.8s on a 2k-token record). Then Ollama, then Gemini.
+    llm_ask_model: str = "groq:openai/gpt-oss-120b"
+    llm_ask_fallbacks: str = "ollama:gpt-oss:120b,gemini:gemini-2.5-flash"
     # Coding round (§8) vision models — gpt-oss is text-only, so these must be
     # image-capable. Two tiers: a FAST one for live screen reads mid-interview, and
     # a bigger one for the scoring pass at conclude (latency-insensitive). Both
@@ -134,6 +144,11 @@ class Settings(BaseSettings):
         if self.livekit_endpointing_max_delay < self.livekit_endpointing_min_delay:
             raise ValueError("LiveKit maximum endpointing delay must be >= minimum delay")
         return self
+
+    @property
+    def ask_fallbacks(self) -> list[str]:
+        """Models tried (in order) if llm_ask_model fails."""
+        return [m.strip() for m in self.llm_ask_fallbacks.split(",") if m.strip()]
 
     @property
     def reasoning_fallbacks(self) -> list[str]:

@@ -94,7 +94,8 @@ def answer(record: PanelRecord, question: str, mode: str = "open",
     answers AND carries the override tool: if the recruiter's message is a clear
     override instruction, it overrules the recommendation on the spot (§7).
     `channel` "chat" (WhatsApp) allows a slightly fuller written answer."""
-    model = get_settings().llm_fast_model
+    settings = get_settings()
+    model, fallbacks = settings.llm_ask_model, settings.ask_fallbacks
     # gpt-oss reasons before answering; chat answers are longer, so more headroom.
     max_tokens = 500 if channel == "chat" else 180
 
@@ -110,8 +111,8 @@ def answer(record: PanelRecord, question: str, mode: str = "open",
             return AskAnswer(question=question, mode="addressed", target=target,
                              answered_by=target, answer=msg)
         messages = prompts.build_ask_prompt(target, render_record(record), question, channel)
-        text = llm_router.chat(messages, model=model, max_tokens=max_tokens,
-                               temperature=0.4, reasoning_effort="low")
+        text = llm_router.chat(messages, model=model, fallbacks=fallbacks,
+                               max_tokens=max_tokens, temperature=0.4, reasoning_effort="low")
         return AskAnswer(question=question, mode="addressed", target=target,
                          answered_by=target, answer=text)
 
@@ -119,8 +120,8 @@ def answer(record: PanelRecord, question: str, mode: str = "open",
     # deterministically by the caller (voice: AskPipeline; text: the override
     # button → /panel/override), not by a fragile LLM tool-call.
     messages = prompts.build_ask_prompt("orchestrator", render_record(record), question, channel)
-    text = llm_router.chat(messages, model=model, max_tokens=max_tokens,
-                           temperature=0.4, reasoning_effort="low")
+    text = llm_router.chat(messages, model=model, fallbacks=fallbacks,
+                           max_tokens=max_tokens, temperature=0.4, reasoning_effort="low")
     return AskAnswer(question=question, mode="open", answered_by="orchestrator", answer=text)
 
 
