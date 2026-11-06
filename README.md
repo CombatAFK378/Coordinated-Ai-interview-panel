@@ -18,6 +18,7 @@ record, never from imagination.
 
 - [What it does](#what-it-does)
 - [How an interview works](#how-an-interview-works)
+- [Who asks next: the formula](#who-asks-next-the-formula)
 - [The panel](#the-panel)
 - [Ask the Panel](#ask-the-panel)
 - [Design principles](#design-principles)
@@ -73,7 +74,8 @@ record, never from imagination.
 
    `λ` rises over the interview so late questions chase what is still unknown;
    recency stops one interviewer dominating; ties break on fixed rules — never at
-   random. Every floor grant is written to the audit log.
+   random. Every floor grant is written to the audit log. In plain English:
+   [Who asks next: the formula](#who-asks-next-the-formula).
 4. **Coding round.** If Liam is on the panel, the coding round starts by the
    candidate's fifth answer at the latest: share the whole screen, solve a classic
    problem out loud, and Liam reacts to what he sees.
@@ -84,6 +86,32 @@ record, never from imagination.
    is rejected in code — and Julian writes a conclusion: **PROCEED**, **PROCEED
    FLAGGED**, **INSUFFICIENT SIGNAL** or **DECLINE**, with the items a human should
    verify.
+
+## Who asks next: the formula
+
+The formula gives every interviewer a score after each answer, and the highest score
+asks the next question:
+
+```
+score = interest × (1 + λ × gap) × recency
+```
+
+### The three parts, in plain English
+
+- **Interest:** "How much do I want to ask next?" Each interviewer rates this from 0
+  to 1 after reading the answer. If the candidate talks about system design, Ethan
+  rates high. If it has nothing to do with Nina's area, she rates low.
+- **Gap:** "How much of my area is still untested?" If nobody has tested ownership
+  yet, Maya's gap is high and her score gets a boost. If Ethan's area is already well
+  covered, his boost is small.
+  - **λ (lambda)** is just a dial for how much the gap matters. It starts low and
+    grows during the interview. Early on, curiosity decides who speaks. Near the end,
+    untested areas matter more, so nothing important is missed.
+- **Recency:** "Did I just speak?" If yes, the score is halved. If you spoke two
+  turns ago, it's cut by 20%. This stops one interviewer from hogging the
+  conversation.
+
+Implemented in [`shared/orchestrator.py`](shared/orchestrator.py).
 
 ## The panel
 
