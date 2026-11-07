@@ -314,7 +314,8 @@ def _voice_settings():
         "LIVEKIT_API_KEY": settings.livekit_api_key,
         "LIVEKIT_API_SECRET": settings.livekit_api_secret,
         "DEEPGRAM_API_KEY": settings.deepgram_api_key,
-        **({"SARVAM_API_KEY": settings.sarvam_api_key} if settings.stt_provider == "sarvam" else {}),
+        **({"SARVAM_API_KEY": settings.sarvam_api_key}
+           if "sarvam" in (settings.stt_provider, settings.ask_stt_provider) else {}),
     }.items() if not value]
     if not (settings.ollama_api_key or settings.groq_keys
             or settings.openrouter_api_key or settings.gemini_api_key):

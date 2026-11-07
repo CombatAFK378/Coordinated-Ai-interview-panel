@@ -201,9 +201,10 @@ cross-provider fallback chain:
 | Ask the Panel answers (voice + WhatsApp), "which interview?" lookup | Groq `gpt-oss-120b` (key pool) — ~1 s faster | `ollama:gpt-oss:120b` → Gemini 2.5 Flash |
 | Dossier, blind scoring, debate, conclusion, counterfactuals | `ollama:minimax-m3` (thinking off) | Gemini 2.5 Flash → Groq `gpt-oss-120b` |
 | Live coding round (screen + voice) | Gemini Live (`gemini-3.1-flash-live-preview`), in the browser | Screenshot reads via an OpenRouter vision model |
-| Speech-to-text | Deepgram `nova-3`, Indian English (`en-IN`) | Sarvam `saaras:v3` — switch with `STT_PROVIDER=sarvam` |
+| Speech-to-text | Deepgram `nova-3`, Indian English (`en-IN`) | Sarvam `saaras:v3` — switch with `STT_PROVIDER=sarvam`, or for Ask the Panel only with `ASK_STT_PROVIDER=sarvam` |
 | Voices | Deepgram Aura-2, one voice per persona | — |
 | Turn-taking audio | LiveKit `v1-mini` turn detector (runs locally) + Silero VAD | — |
+| Noise cancellation | LiveKit BVC (its telephony model on phone calls) | `LIVEKIT_NOISE_CANCELLATION`, or for Ask the Panel only `ASK_NOISE_CANCELLATION` (`bvc`, `nc` or `off`) |
 
 The rule: **fast model where the candidate is waiting, deep model where the decision
 is made.** If the reasoning model falls back, a badge in the page header says so.
@@ -226,7 +227,7 @@ session at a time; WhatsApp chats run alongside it.
 | [Deepgram](https://deepgram.com/) | `DEEPGRAM_API_KEY` | **Required** — speech-to-text and the six voices |
 | [Ollama Cloud](https://ollama.com/) | `OLLAMA_API_KEY` | **Required** — interviewers and orchestrator (a paid plan avoids rate limits) |
 | [Groq](https://console.groq.com/) | `GROQ_API_KEY` or `GROQ_API_KEYS` (comma-separated pool) | Recommended — fastest Ask the Panel answers, and the interview's fallback |
-| [Sarvam](https://www.sarvam.ai/) | `SARVAM_API_KEY` | Optional — speech-to-text tuned for Indian accents (`STT_PROVIDER=sarvam`) |
+| [Sarvam](https://www.sarvam.ai/) | `SARVAM_API_KEY` | Optional — speech-to-text tuned for Indian accents (`STT_PROVIDER=sarvam`, or `ASK_STT_PROVIDER=sarvam` for Ask the Panel only) |
 | [Google AI Studio](https://aistudio.google.com/) | `GEMINI_API_KEY` | Optional — the Gemini Live coding round, and a model fallback |
 | [OpenRouter](https://openrouter.ai/) | `OPENROUTER_API_KEY` | Optional — screenshot-based coding round when Gemini isn't set |
 | LiveKit phone number | — (see [By phone](#5-ask-the-panel-by-phone)) | Optional — Ask the Panel by phone |
@@ -359,7 +360,9 @@ interviewers by voice, exactly as if the interview had just finished.
 1. Dial the number. Julian: *"Which interview would you like to talk about?"*
 2. Say *"Vikram's 4:30 interview"* (name, time, or both; "yesterday" or a weekday
    works too). If several fit, Julian lists them — answer *"the second one"* or give
-   the time; if one fits, *"yes"*.
+   the time; if one fits, *"yes"*. A name the phone line mishears is matched by how
+   it sounds (*"summer"* still finds Samar), and *"the latest interview"* needs no
+   name at all.
 3. Ask the panel by name, as in the browser.
 4. *"Now let's talk about Priya's interview"* switches; *"that's all, bye"* hangs up.
 

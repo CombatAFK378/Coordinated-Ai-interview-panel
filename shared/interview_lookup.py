@@ -37,7 +37,10 @@ _NUMBER_PICK = re.compile(r"\s*(?:no\.?|number|option|#)?\s*(\d)\s*[.!]?\s*", re
 
 _PARSE_SYSTEM = (
     "A recruiter has phoned an AI interview panel and is saying which past interview "
-    "they want to discuss. The text is live speech-to-text, so names may be misspelled. "
+    "they want to discuss. The text is live speech-to-text, so names may be misspelled, "
+    "or even turned into ordinary words (an Indian name like Samar can come out as "
+    "'summer'). Whatever word stands where the candidate's name goes ('talk about "
+    "summer', 'summer's interview') is the name — return it exactly as heard. "
     "Extract ONLY what they actually said — never guess or fill in.\n"
     "Output ONLY compact JSON:\n"
     '{"name": "<candidate name as heard, or empty>", '
@@ -107,6 +110,30 @@ def name_score(heard: str, saved: str) -> float:
     return max(difflib.SequenceMatcher(None, a, b).ratio() for a in h for b in s)
 
 
+_SOUNDEX = {**dict.fromkeys("bfpv", "1"), **dict.fromkeys("cgjkqsxz", "2"),
+            **dict.fromkeys("dt", "3"), "l": "4", **dict.fromkeys("mn", "5"), "r": "6"}
+
+
+def _soundex(word: str) -> str:
+    """Classic Soundex: words that sound alike share a code ("Samar" and
+    "summer" are both S560, "Yokesh" and "Yogesh" both Y220)."""
+    code, prev = word[0].upper(), _SOUNDEX.get(word[0], "")
+    for ch in word[1:]:
+        digit = _SOUNDEX.get(ch, "")
+        if digit and digit != prev:
+            code += digit
+        if ch not in "hw":
+            prev = digit
+    return (code + "000")[:4]
+
+
+def sounds_like(heard: str, saved: str) -> bool:
+    """A heard word sounds like a word of the saved name — the fallback when
+    speech-to-text turns a name into an ordinary word, too far off to spell-match."""
+    codes = {_soundex(w) for w in _tokens(heard)}
+    return any(_soundex(w) in codes for w in _tokens(saved))
+
+
 def mentioned(text: str, rows: list[dict]) -> list[dict]:
     """Saved interviews whose candidate is named anywhere in `text`."""
     return [r for r in rows if name_score(text, r.get("candidate_name") or "") >= NAME_THRESHOLD]
@@ -142,8 +169,12 @@ def match(hints: Hints, rows: list[dict], current: datetime,
     tz = current.tzinfo
     rows = [r for r in rows if not within or r.get("interview_id") in within]
     if hints.name:
-        rows = [r for r in rows
-                if name_score(hints.name, r.get("candidate_name") or "") >= NAME_THRESHOLD]
+        # Spelling first; sound only if nothing is spelled close enough, so an
+        # exact "Vikram" never turns ambiguous with a sound-alike "Vikrant".
+        named = [r for r in rows
+                 if name_score(hints.name, r.get("candidate_name") or "") >= NAME_THRESHOLD]
+        rows = named or [r for r in rows
+                         if sounds_like(hints.name, r.get("candidate_name") or "")]
     day = _target_day(hints.day, current)
     if day:
         rows = [r for r in rows if _when(r, tz).date() == day]

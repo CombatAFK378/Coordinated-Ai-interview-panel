@@ -118,3 +118,25 @@ def test_stt_provider_is_chosen_from_settings(settings, monkeypatch):
                                                   'livekit_stt_language': 'en-IN'})
     name, kw = LiveKitSession(sarvam_settings, 'room', 'candidate')._make_stt()
     assert name == 'sarvam' and kw['model'] == 'saaras:v3' and kw['language'] == 'en-IN'
+
+
+def test_ask_the_panel_can_use_its_own_stt(settings, monkeypatch):
+    import livekit_session
+    monkeypatch.setattr(livekit_session.deepgram, 'STT', lambda **kw: ('deepgram', kw))
+    monkeypatch.setattr(livekit_session.sarvam, 'STT', lambda **kw: ('sarvam', kw))
+    split = settings.model_copy(update={'ask_stt_provider': 'sarvam', 'sarvam_api_key': 'sk'})
+    assert LiveKitSession(split, 'room', 'candidate')._make_stt()[0] == 'deepgram'
+    assert LiveKitSession(split, 'room', 'recruiter', recruiter=True)._make_stt()[0] == 'sarvam'
+    assert LiveKitSession(split, 'room', 'caller', recruiter=True, phone=True)._make_stt()[0] == 'sarvam'
+    # Left empty, Ask the Panel follows STT_PROVIDER.
+    assert LiveKitSession(settings, 'room', 'recruiter', recruiter=True)._make_stt()[0] == 'deepgram'
+
+
+def test_ask_the_panel_can_turn_off_noise_cancellation(settings):
+    split = settings.model_copy(update={'livekit_noise_cancellation': 'bvc',
+                                        'ask_noise_cancellation': 'off'})
+    assert LiveKitSession(split, 'room', 'candidate')._noise_cancellation() == 'bvc'
+    assert LiveKitSession(split, 'room', 'caller', recruiter=True,
+                          phone=True)._noise_cancellation() == 'off'
+    follow = split.model_copy(update={'ask_noise_cancellation': ''})
+    assert LiveKitSession(follow, 'room', 'recruiter', recruiter=True)._noise_cancellation() == 'bvc'

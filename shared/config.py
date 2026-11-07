@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
     livekit_noise_cancellation: Literal["bvc", "nc", "off"] = "bvc"
+    # Ask the Panel (web voice and phone calls) only. Empty = same as above.
+    ask_noise_cancellation: Literal["", "bvc", "nc", "off"] = ""
     livekit_stt_model: str = "nova-3"
     livekit_stt_language: str = "en-IN"         # Indian English (Deepgram nova-3)
     livekit_endpointing_min_delay: float = Field(default=0.5, ge=0)
@@ -23,6 +25,10 @@ class Settings(BaseSettings):
     # Speech-to-text engine: Deepgram (livekit_stt_model) or Sarvam, built for
     # Indian accents and names. Both use livekit_stt_language (e.g. en-IN).
     stt_provider: Literal["deepgram", "sarvam"] = "deepgram"
+    # Ask the Panel (web voice and phone calls) can use its own engine — Indian
+    # candidate names on a phone line are where Sarvam helps most. Empty = same
+    # as stt_provider.
+    ask_stt_provider: Literal["", "deepgram", "sarvam"] = ""
     sarvam_api_key: str = ""
     sarvam_stt_model: str = "saaras:v3"
 

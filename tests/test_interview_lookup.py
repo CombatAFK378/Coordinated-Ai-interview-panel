@@ -32,6 +32,17 @@ def test_name_score(heard, saved, ok):
     assert (lookup.name_score(heard, saved) >= lookup.NAME_THRESHOLD) is ok
 
 
+@pytest.mark.parametrize('heard,saved', [('summer', 'Samar'), ('Yogesh', 'Yokesh')])
+def test_misheard_name_matches_by_sound(heard, saved):
+    rows = [row('s', saved, 24, 15, 0), row('x', 'Shashank', 24, 12, 0)]
+    assert [r['interview_id'] for r in lookup.match(Hints(name=heard), rows, NOW)] == ['s']
+
+
+def test_spelling_match_beats_sound_alike():
+    rows = [row('a', 'Vikram', 24, 16, 0), row('b', 'Vikrant', 24, 11, 0)]
+    assert [r['interview_id'] for r in lookup.match(Hints(name='Vikram'), rows, NOW)] == ['a']
+
+
 def test_name_and_time_pick_one():
     found = lookup.match(Hints(name='Vikram Rao', minutes=16 * 60 + 30), ROWS, NOW)
     assert [r['interview_id'] for r in found] == ['a']

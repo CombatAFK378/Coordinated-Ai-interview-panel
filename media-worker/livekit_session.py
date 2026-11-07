@@ -61,6 +61,8 @@ class LiveKitSession:
         # links to whichever SIP participant is in the room, and its audio is
         # narrowband telephony.
         self.phone = phone
+        # Ask the Panel (recruiter, web or phone) may use its own speech-to-text.
+        self.recruiter = recruiter
         # Barge-in policy differs by surface:
         #  - Interview: follows settings.allow_bargein. On speakers, echo/noise
         #    falsely triggers barge-in and chops interviewers off mid-word (Liam's
@@ -144,10 +146,22 @@ class LiveKitSession:
             self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
 
-    def _make_stt(self):
-        """The speech-to-text engine chosen in .env (STT_PROVIDER)."""
+    def _stt_provider(self) -> str:
+        """STT_PROVIDER, or ASK_STT_PROVIDER (when set) for Ask the Panel."""
         s = self.settings
-        if s.stt_provider == "sarvam":
+        return (s.ask_stt_provider or s.stt_provider) if self.recruiter else s.stt_provider
+
+    def _noise_cancellation(self) -> str:
+        """LIVEKIT_NOISE_CANCELLATION, or ASK_NOISE_CANCELLATION (when set) for Ask the Panel."""
+        s = self.settings
+        if self.recruiter:
+            return s.ask_noise_cancellation or s.livekit_noise_cancellation
+        return s.livekit_noise_cancellation
+
+    def _make_stt(self):
+        """The speech-to-text engine chosen in .env."""
+        s = self.settings
+        if self._stt_provider() == "sarvam":
             return sarvam.STT(api_key=s.sarvam_api_key, model=s.sarvam_stt_model,
                               language=s.livekit_stt_language, http_session=self._http)
         return deepgram.STT(api_key=s.deepgram_api_key, model=s.livekit_stt_model,
@@ -157,8 +171,9 @@ class LiveKitSession:
         self._http = aiohttp.ClientSession()
         self._room = rtc.Room()
         self._stt = self._make_stt()
-        logger.info("STT: %s (%s, %s)", self.settings.stt_provider,
-                    self.settings.sarvam_stt_model if self.settings.stt_provider == "sarvam"
+        provider = self._stt_provider()
+        logger.info("STT: %s (%s, %s)", provider,
+                    self.settings.sarvam_stt_model if provider == "sarvam"
                     else self.settings.livekit_stt_model, self.settings.livekit_stt_language)
         self._voices = {
             aid: deepgram.TTS(api_key=self.settings.deepgram_api_key,
@@ -211,7 +226,7 @@ class LiveKitSession:
         if self.phone:   # BVC's telephony model is tuned for narrowband call audio
             filters = {"bvc": noise_cancellation.BVCTelephony,
                        "nc": noise_cancellation.BVCTelephony}
-        make_filter = filters.get(self.settings.livekit_noise_cancellation)
+        make_filter = filters.get(self._noise_cancellation())
         link = ({"participant_kinds": [rtc.ParticipantKind.PARTICIPANT_KIND_SIP]}
                 if self.phone else {"participant_identity": self.identity})
         await self._voice.start(
